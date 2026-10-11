@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "provider": "cloudflare",
-  "cliVersion": "1.0.0-rc.47",
-  "providerVersion": "1.0.0-rc.47",
-  "serverVersion": "1.0.0-rc.47",
+  "cliVersion": "1.0.0",
+  "providerVersion": "1.0.0",
+  "serverVersion": "1.0.0",
   "infrastructureGeneration": 1,
   "clientAuth": {
     "plugin": "apiKeys",
@@ -21,11 +21,11 @@
     }
   ],
   "packages": {
-    "hot-updater": "1.0.0-rc.47",
-    "@hot-updater/server": "1.0.0-rc.47",
-    "@hot-updater/react-native": "1.0.0-rc.47",
-    "@hot-updater/cloudflare": "1.0.0-rc.47",
-    "@hot-updater/expo": "1.0.0-rc.47"
+    "hot-updater": "1.0.0",
+    "@hot-updater/server": "1.0.0",
+    "@hot-updater/react-native": "1.0.0",
+    "@hot-updater/cloudflare": "1.0.0",
+    "@hot-updater/expo": "1.0.0"
   },
   "requiredInputs": {
     "workerName": "codex-relay-ota-rc22",
@@ -49,9 +49,9 @@
     "SETUP.md": "c30d729a7cfa62dc5a8e35832a5dd48d708a3685a089936562f607f87981aafe",
     "upgrades/1.0.0.md": "42c3424ffb0a286fdc0253afad2b31e8abc34d2fb7a060fc5818b5be2d6a76d5",
     "upgrades/README.md": "e0dcb92507473dd84e03530e4458033b66ca4824fc0aa147ed4c22bf5b82561c",
-    "worker/dist/index.js": "aad5f6c00fbbb614cfed3986ff66b968b030ff0e51ce9dc3070638df98bb3f94",
-    "worker/dist/index.js.map": "4c5358c9570b594152512926c27ac4d19e38c7c51d30b0e36ddc3d8afcf1170d",
-    "worker/dist/README.md": "46d2692ce4fa0bce40f89f6d981f8c03c3eae597f673033072003451ca525828",
+    "worker/dist/index.js": "882e4f1525645c6554040e5ce99f4ccf0d83beeb6aeacc03cca76a41735ad828",
+    "worker/dist/index.js.map": "01d1dea6b810a8b56ca4a140e6aeeae03c80d57f5bc2185d98b930aaf1801d32",
+    "worker/dist/README.md": "73ce2a5db2d12b5b6a3f9b1ceeb45349b70682cda8a31d0742d5db97db6dab8d",
     "worker/migrations/0001_hot-updater_1.0.0.sql": "ed96ee68fe1511d77fcec2cdd704389a68f13976814467b45a07fbfae4b3612f",
     "worker/package.json": "f5c51eff03c6bba7c761a556932a9ab6f06cbb3c188d3e7224e52da8f19857e2",
     "worker/wrangler.json": "fc08283babe060a4e307c8d3cbcb53742f6c4301fdd3ae228939ecf068b4fbd9"

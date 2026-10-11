@@ -912,3 +912,17 @@ Private receipts are under `.codex/mobile-1.6/rc47/`.
 **OTA `1.6.2-ship.2`.** Release PR [#121](https://github.com/gronxb/codex-relay/pull/121) (merge `86d661b`) had CI deploy `1.6.2-ship.2` at 23:21:34Z: release `01a1281e-4d2e-74e5-9c7e-24d7f72b9090`, bundle `01a1281a-d1fe-7092-99b0-d3166d1dd508`, 100% of production, targeting 1.6.2. After a dry run, `hot-updater bundle update 01a1281e-… --target-app-version 1.6.x --expected-revision 1 -y` widened it at 23:22:30Z: revision 2, and catalog generation 33 → 34, with `1.6.2-ship.2` first for 1.6.0, 1.6.1 and 1.6.2. To undo the widening, set the target back to `1.6.2`.
 
 In the first 20 minutes, 12 installations downloaded it (8 on 1.6.1, 4 on 1.6.2), and 3 applied it on SDK rc.47: two 1.6.1 binaries, which carry the RC36 native module, and one 1.6.2. No installation recovered. One download failed on SDK rc.36, which fetched the manifest with HTTP 200 and then failed the download.
+
+## Official 1.0.0 upgrade (2026-10-11 KST)
+
+Release [#1514](https://github.com/gronxb/hot-updater/pull/1514) published `1.0.0`, the first stable release, from `647828bb0`. Its code equals RC47 apart from the version string, so this upgrade moves the server and the Console and ships no OTA: `1.6.2-ship.2` already carries the same SDK JavaScript.
+
+1. Time Travel bookmark `00000b83-00000002-00005101-510411cfb5510457a51117ce9711aa73` was taken first.
+2. The 1.0.0 Worker was uploaded as version `caaa77c4-2143-458c-baf7-c31e7093c2ff` without traffic. Only `worker/dist` and the manifest versions changed. Its preview URL reported `1.0.0`, served catalog generation 34 for 1.6.0, 1.6.1 and 1.6.2 with `1.6.2-ship.2` first, presigned the artifacts on R2 (206), and answered `/remote-config` with 200 with the API key and 401 without.
+3. At 02:45:04Z, 100% of traffic moved to `caaa77c4`. The Ship console rolled to `ship/codex-relay:v1.0.0-647828b` five seconds later.
+
+**Validation.** Doctors: scaffold passed; infrastructure passed all 7 checks for 1.6.0, 1.6.1 and 1.6.2; app passed. `/version` (cache-busted) reports `1.0.0`. Catalogs, artifacts, the R2 bounded list and Remote Config answer as before. The Console pod is running and the public URL answers 200.
+
+**Rollback.** `versions deploy a42627ee-b81a-45d7-b00c-d846e0132d84@100%` and the `ship/codex-relay:rc47-69b6439` console image.
+
+Private receipts are under `.codex/mobile-1.6/v1.0.0/`.
