@@ -926,3 +926,19 @@ Release [#1514](https://github.com/gronxb/hot-updater/pull/1514) published `1.0.
 **Rollback.** `versions deploy a42627ee-b81a-45d7-b00c-d846e0132d84@100%` and the `ship/codex-relay:rc47-69b6439` console image.
 
 Private receipts are under `.codex/mobile-1.6/v1.0.0/`.
+
+## 1.0.6 upgrade (2026-10-15 KST)
+
+Release [#1553](https://github.com/gronxb/hot-updater/pull/1553) published `1.0.6` from `e0da0a278`. It carries [#1555](https://github.com/gronxb/hot-updater/pull/1555) (artifact protocol v2: the server signs only the files a device downloads), [#1550](https://github.com/gronxb/hot-updater/pull/1550) and [#1547](https://github.com/gronxb/hot-updater/pull/1547). No schema, marker, binding or secret changed, so this upgrade moves the server and the Console only.
+
+The app keeps `@hot-updater/react-native` at `1.0.0` and ships no OTA. A 1.0.6 SDK asks the server for artifact protocol v2 and hands native a files URL, which native code built from an older SDK does not read, so the SDK moves only with a new native build. The CLI, `@hot-updater/cloudflare` and `@hot-updater/expo` are pinned to `1.0.6`.
+
+1. Time Travel bookmark `000010f9-00000000-00005104-b36aebccc117a492819508eea3cd2925` was taken first.
+2. The 1.0.6 Worker was uploaded as version `410b6cdf-96c2-48d7-8d4d-6f15174a5fa5` without traffic. Its preview URL reported `1.0.6`, served catalog generation 34 for 1.6.0, 1.6.1 and 1.6.2, answered artifact protocol v1 with every file (28) and v2 with no per-file URL, signed only the requested path on the files route, and answered `/remote-config` with 200 with the API key and 401 without.
+3. At 23:20:04Z, 100% of traffic moved to `410b6cdf`. The Ship console rolled to `ship/codex-relay:v1.0.6-e0da0a2` six seconds later.
+
+**Validation.** Doctors: scaffold passed; infrastructure passed all 7 checks for 1.6.0, 1.6.1 and 1.6.2; app passed. Production `/version` (cache-busted) reports `1.0.6`, and catalogs, artifacts and Remote Config answer as on the preview. The Console pod is running and the public URL answers 200.
+
+**Rollback.** `versions deploy caaa77c4-2143-458c-baf7-c31e7093c2ff@100%` and the `ship/codex-relay:v1.0.0-647828b` console image.
+
+Private receipts are under `.codex/mobile-1.6/v1.0.6/`.

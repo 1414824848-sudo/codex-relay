@@ -9,7 +9,7 @@
     "bucketName": "codex-relay-rc22-storage"
   },
   "baseUrl": "https://codex-relay-ota-rc22.gron1gh1.workers.dev",
-  "deployedServerVersion": "1.0.0",
+  "deployedServerVersion": "1.0.6",
   "pendingStep": null,
   "verifiedSteps": [
     {
@@ -3037,6 +3037,58 @@
           "publicUrl": 200
         }
       }
+    },
+    {
+      "id": "v1.0.6:worker-version",
+      "action": "Upload the 1.0.6 Worker as a new version without traffic",
+      "target": {
+        "accountId": "e8488f1eee751a6aa2d4831c5de1c3dc",
+        "workerName": "codex-relay-ota-rc22",
+        "packageVersion": "1.0.6",
+        "variables": ["ACCOUNT_ID", "BUCKET_NAME"],
+        "secrets": ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+      },
+      "requestId": "410b6cdf-96c2-48d7-8d4d-6f15174a5fa5",
+      "observation": "Only worker/dist and the manifest versions/hashes changed (plus COMMON.md, upgrades/README.md and app/provision-client-credential.mjs from the scaffold). Preview reported 1.0.6, catalogs gen 34 for 1.6.0/1.6.1/1.6.2, artifact v1 200 with 28 assets, artifact v2 200 with no per-file URLs, files route signed the requested path only, /remote-config 200 with the key and 401 without.",
+      "checkedAt": "2026-10-14T23:12:00Z"
+    },
+    {
+      "id": "v1.0.6:cutover",
+      "action": "Route 100% to 1.0.6 version 410b6cdf, roll the Ship console to 1.0.6",
+      "target": {
+        "workerName": "codex-relay-ota-rc22",
+        "previousVersionId": "caaa77c4-2143-458c-baf7-c31e7093c2ff",
+        "console": {
+          "context": "kind-ship",
+          "namespace": "ship-services",
+          "deployment": "codex-relay",
+          "previousImage": "ship/codex-relay:v1.0.0-647828b",
+          "image": "ship/codex-relay:v1.0.6-e0da0a2"
+        }
+      },
+      "observation": "Worker at 100% at 23:20:04Z; console rolled out at 23:20:10Z. D1 Time Travel bookmark taken first: 000010f9-00000000-00005104-b36aebccc117a492819508eea3cd2925. No schema, marker, binding or secret change.",
+      "checkedAt": "2026-10-14T23:20:04Z"
+    },
+    {
+      "id": "common.verify.v1.0.6",
+      "action": "Verify 1.0.6 infrastructure, local app configuration and the Console",
+      "target": {
+        "serverVersion": "1.0.6",
+        "baseUrl": "https://codex-relay-ota-rc22.gron1gh1.workers.dev",
+        "platform": "ios",
+        "channel": "production",
+        "appVersions": ["1.6.0", "1.6.1", "1.6.2"]
+      },
+      "observation": {
+        "scaffoldDoctorPassed": true,
+        "infrastructureDoctorPassed": true,
+        "infrastructureChecks": "7/7 for 1.6.0, 1.6.1 and 1.6.2",
+        "appDoctorPassed": true,
+        "version": "1.0.6",
+        "artifactV2": "no per-file URLs; files route signs requested paths",
+        "consoleUrlStatus": 200
+      },
+      "checkedAt": "2026-10-14T23:25:00Z"
     }
   ]
 }
