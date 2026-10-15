@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "provider": "cloudflare",
-  "cliVersion": "1.0.6",
-  "providerVersion": "1.0.6",
-  "serverVersion": "1.0.6",
+  "cliVersion": "1.0.7",
+  "providerVersion": "1.0.7",
+  "serverVersion": "1.0.7",
   "infrastructureGeneration": 1,
   "clientAuth": {
     "plugin": "apiKeys",
@@ -21,11 +21,11 @@
     }
   ],
   "packages": {
-    "hot-updater": "1.0.6",
-    "@hot-updater/server": "1.0.6",
-    "@hot-updater/react-native": "1.0.6",
-    "@hot-updater/cloudflare": "1.0.6",
-    "@hot-updater/expo": "1.0.6"
+    "hot-updater": "1.0.7",
+    "@hot-updater/server": "1.0.7",
+    "@hot-updater/react-native": "1.0.7",
+    "@hot-updater/cloudflare": "1.0.7",
+    "@hot-updater/expo": "1.0.7"
   },
   "requiredInputs": {
     "workerName": "codex-relay-ota-rc22",
@@ -49,9 +49,9 @@
     "SETUP.md": "c30d729a7cfa62dc5a8e35832a5dd48d708a3685a089936562f607f87981aafe",
     "upgrades/1.0.0.md": "42c3424ffb0a286fdc0253afad2b31e8abc34d2fb7a060fc5818b5be2d6a76d5",
     "upgrades/README.md": "341e428565e35666b427f53e27ad97428183729f1aba21825b5bcfaa00bef770",
-    "worker/dist/index.js": "0b74c61c9f253cc8ca07a022f4aa07035671914a56007ed100d00b5536125abb",
-    "worker/dist/index.js.map": "74275d0b97749095570747dad46562c0ad4497604c9acfe5797846f101b9c914",
-    "worker/dist/README.md": "d51882ceb3aff5d4680b3db3cf0e5c5e22d72b6d9bcbca69e0df03516ff447a3",
+    "worker/dist/index.js": "9dbe9bbd7f25a0ddf2c64764dd24927ecc0cd05f956c07d8023f433008e0caab",
+    "worker/dist/index.js.map": "ee3a807e8c461687e1a77b0e50cf7b80c8ce2999319d66293062a6e8a4b8d267",
+    "worker/dist/README.md": "03824cf99b64e98adac91a09af4dda942864b43ccde3b78f69c3633ed9a4e7e4",
     "worker/migrations/0001_hot-updater_1.0.0.sql": "ed96ee68fe1511d77fcec2cdd704389a68f13976814467b45a07fbfae4b3612f",
     "worker/package.json": "f5c51eff03c6bba7c761a556932a9ab6f06cbb3c188d3e7224e52da8f19857e2",
     "worker/wrangler.json": "fc08283babe060a4e307c8d3cbcb53742f6c4301fdd3ae228939ecf068b4fbd9"

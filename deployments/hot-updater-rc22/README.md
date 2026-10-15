@@ -942,3 +942,19 @@ The app keeps `@hot-updater/react-native` at `1.0.0` and ships no OTA. A 1.0.6 S
 **Rollback.** `versions deploy caaa77c4-2143-458c-baf7-c31e7093c2ff@100%` and the `ship/codex-relay:v1.0.0-647828b` console image.
 
 Private receipts are under `.codex/mobile-1.6/v1.0.6/`.
+
+## 1.0.7 upgrade and SDK OTA (2026-10-15 KST)
+
+Release [#1560](https://github.com/gronxb/hot-updater/pull/1560) published `1.0.7` from `d190ffb1d`. It carries [#1558](https://github.com/gronxb/hot-updater/pull/1558): the SDK's JavaScript asks for artifact protocol v2 only when the app's native code has `installArtifact`, and otherwise installs over v1 exactly as `1.0.0` did, so the SDK can reach native code built from an older SDK by OTA. The server code differs from `1.0.6` only in its version; no schema, marker, binding or secret changed.
+
+The app now pins `@hot-updater/react-native`, the CLI, `@hot-updater/cloudflare` and `@hot-updater/expo` to `1.0.7`, and the SDK's JavaScript ships by OTA. Since `1.0.0`, the SDK's JavaScript differs toward native code only in that capability-checked path.
+
+1. Time Travel bookmark `00001136-00000002-00005105-e0a1cae17c6b0352fa99025198eba490` was taken first.
+2. The 1.0.7 Worker was uploaded as version `76870c9c-24ea-4eba-b209-5dcf9f056771` without traffic. Its preview URL reported `1.0.7`, served catalog generation 34 for 1.6.0, 1.6.1 and 1.6.2, answered artifact protocol v1 with every file (28) and v2 with no per-file URL, signed only the requested path on the files route, and answered `/remote-config` with 200 with the API key and 401 without.
+3. At 02:54Z, 100% of traffic moved to `76870c9c`, and the Ship console rolled to `ship/codex-relay:v1.0.7-d190ffb`.
+
+**Validation.** Doctors: scaffold passed; infrastructure passed all 7 checks for 1.6.0, 1.6.1 and 1.6.2; app passed. Production `/version` reports `1.0.7`, and catalogs, artifacts and Remote Config answer as on the preview. The public Console URL answers 200.
+
+**Rollback.** `versions deploy 410b6cdf-96c2-48d7-8d4d-6f15174a5fa5@100%` and the `ship/codex-relay:v1.0.6-e0da0a2` console image.
+
+Private receipts are under `.codex/mobile-1.6/v1.0.7/`.
