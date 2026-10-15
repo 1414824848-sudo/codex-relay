@@ -958,3 +958,9 @@ The app now pins `@hot-updater/react-native`, the CLI, `@hot-updater/cloudflare`
 **Rollback.** `versions deploy 410b6cdf-96c2-48d7-8d4d-6f15174a5fa5@100%` and the `ship/codex-relay:v1.0.6-e0da0a2` console image.
 
 Private receipts are under `.codex/mobile-1.6/v1.0.7/`.
+
+**OTA `1.6.2-ship.3`.** Release PR [#124](https://github.com/gronxb/codex-relay/pull/124) (merge `9f79900`) had CI deploy `1.6.2-ship.3` at 03:08Z: release `01a13d86-86f7-7830-952d-21238207019f`, bundle `01a13d83-0b72-771b-80fe-3af88d1b1cab`, 100% of production, targeting 1.6.2. It carries the SDK's 1.0.7 JavaScript.
+
+Before widening, a Release simulator build of app 1.6.2 with native code from SDK `1.0.0` checked the case 1.0.7 fixes. It first installed `1.6.2-ship.3` with its built-in 1.0.0 JavaScript. Then, running 1.0.7 JavaScript on that 1.0.0 native code, it installed a newer check bundle through native `updateBundle` (artifact protocol v1) with the Hermes patch from `1.6.2-ship.3`, and launched it. The check bundle was deployed at rollout 0 to one custom cohort, `ota-check-107`, set only on that simulator (release `01a13d8f-0682-7319-a207-c037ff616595`), and was disabled right after; catalog generation 38 served `1.6.2-ship.3` first again.
+
+After a dry run, `hot-updater bundle update 01a13d86-… --target-app-version 1.6.x --expected-revision 1 -y` widened it at 03:24:28Z: revision 2, catalog generation 38 → 39, with `1.6.2-ship.3` first for 1.6.0, 1.6.1 and 1.6.2. To undo the widening, set the target back to `1.6.2`.
