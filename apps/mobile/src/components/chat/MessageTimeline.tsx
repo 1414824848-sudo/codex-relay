@@ -7,7 +7,7 @@ import {
 } from "@legendapp/list/react-native";
 import { KeyboardAwareLegendList } from "@legendapp/list/keyboard";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, View } from "react-native";
+import { ActivityIndicator, Pressable, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import Animated, {
   Easing,
@@ -15,22 +15,23 @@ import Animated, {
   FadeOut,
   useAnimatedStyle,
   useSharedValue,
-  withDelay,
-  withRepeat,
-  withSequence,
   withTiming,
 } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { ThemedText } from "@/components/themed-text";
+import { Icon } from "@/components/ui/icon";
 import { Colors, Spacing } from "@/constants/theme";
+import { hapticSelection } from "@/lib/haptics";
 
 import { MessageBubble } from "./MessageBubble";
+import { messageItemType, messageKeyExtractor } from "./timeline-message-items";
 import type { WorkspaceMarkdownPreviewTarget } from "./workspace-preview/markdown-target";
+import { RunningFooter } from "./RunningFooter";
+
+export { implementablePlanId } from "./plan-progress";
 
 const MESSAGE_ESTIMATED_ITEM_SIZE = 48;
-const RUNNING_PULSE_HALF_DURATION_MS = 760;
-const RUNNING_DOT_STAGGER_MS = RUNNING_PULSE_HALF_DURATION_MS / 3;
 const MAINTAIN_SCROLL_AT_END: MaintainScrollAtEndOptions = {
   animated: false,
   on: {
@@ -46,6 +47,8 @@ const MAINTAIN_VISIBLE_CONTENT_POSITION: MaintainVisibleContentPositionConfig<Ch
 const MAINTAIN_SCROLL_AT_END_THRESHOLD = 0.1;
 const TIMELINE_LOADING_ENTER = FadeIn.duration(140).easing(Easing.out(Easing.cubic));
 const TIMELINE_LOADING_EXIT = FadeOut.duration(120).easing(Easing.out(Easing.cubic));
+const SCROLL_TO_END_ENTER = FadeIn.duration(140).easing(Easing.out(Easing.cubic));
+const SCROLL_TO_END_EXIT = FadeOut.duration(120).easing(Easing.out(Easing.cubic));
 const TIMELINE_CONTENT_SETTLE_OFFSET = 10;
 
 export function MessageTimeline({
@@ -56,6 +59,7 @@ export function MessageTimeline({
   messages,
   onKeyboardDismissRequest,
   onMessageCopied,
+  onMessageRewind,
   onOpenMarkdownAttachment,
   threadId,
 }: {
@@ -66,13 +70,16 @@ export function MessageTimeline({
   messages: ChatMessage[];
   onKeyboardDismissRequest?: () => void;
   onMessageCopied?: () => void;
+  onMessageRewind?: (message: ChatMessage) => void;
   onOpenMarkdownAttachment?: (target: WorkspaceMarkdownPreviewTarget) => void;
   threadId?: string;
 }) {
   const listRef = useRef<LegendListRef | null>(null);
+  const removeAtEndListenerRef = useRef<(() => void) | null>(null);
   const { bottom } = useSafeAreaInsets();
   const rows = messages;
   const timelineKey = threadId ?? "no-thread";
+  const [isAtEnd, setIsAtEnd] = useState(true);
   const [settledTimelineKey, setSettledTimelineKey] = useState<string | undefined>(undefined);
   const extraContentPadding = useSharedValue(0);
   const contentRevealProgress = useSharedValue(0);
@@ -92,8 +99,16 @@ export function MessageTimeline({
   }, [bottomAccessoryHeight, extraContentPadding]);
 
   useEffect(() => {
+    setIsAtEnd(true);
     setSettledTimelineKey(undefined);
   }, [timelineKey]);
+
+  useEffect(
+    () => () => {
+      removeAtEndListenerRef.current?.();
+    },
+    [],
+  );
 
   useEffect(() => {
     if (isLoading || !hasRows) {
@@ -129,16 +144,32 @@ export function MessageTimeline({
       <MessageBubble
         message={item}
         onMessageCopied={onMessageCopied}
+        onMessageRewind={onMessageRewind}
         onOpenMarkdownAttachment={onOpenMarkdownAttachment}
       />
     ),
-    [onMessageCopied, onOpenMarkdownAttachment],
+    [onMessageCopied, onMessageRewind, onOpenMarkdownAttachment],
   );
   const handleTimelineLoad = useCallback(() => {
     requestAnimationFrame(() => {
       setSettledTimelineKey(timelineKey);
     });
   }, [timelineKey]);
+  const handleListRef = useCallback((list: LegendListRef | null) => {
+    removeAtEndListenerRef.current?.();
+    listRef.current = list;
+    if (!list) {
+      return;
+    }
+
+    const listState = list.getState();
+    setIsAtEnd(listState.isAtEnd);
+    removeAtEndListenerRef.current = listState.listen("isAtEnd", setIsAtEnd);
+  }, []);
+  const handleScrollToEnd = useCallback(() => {
+    hapticSelection();
+    void listRef.current?.scrollToEnd({ animated: true }).catch(() => undefined);
+  }, []);
 
   return (
     <View onTouchStart={onKeyboardDismissRequest} style={styles.transitionHost}>
@@ -155,7 +186,7 @@ export function MessageTimeline({
           <Animated.View style={[styles.transitionScene, timelineContentStyle]}>
             <KeyboardAwareLegendList
               key={timelineKey}
-              ref={listRef}
+              ref={handleListRef}
               alignItemsAtEnd
               automaticallyAdjustContentInsets={false}
               contentInsetAdjustmentBehavior="never"
@@ -187,6 +218,24 @@ export function MessageTimeline({
           </Animated.View>
         )
       ) : null}
+      {!showLoadingConversation && hasRows && !isAtEnd ? (
+        <Animated.View
+          entering={SCROLL_TO_END_ENTER}
+          exiting={SCROLL_TO_END_EXIT}
+          pointerEvents="box-none"
+          style={styles.scrollToEndContainer}
+        >
+          <Pressable
+            accessibilityLabel="Scroll to latest message"
+            accessibilityRole="button"
+            hitSlop={8}
+            onPress={handleScrollToEnd}
+            style={({ pressed }) => [styles.scrollToEndButton, pressed && styles.pressed]}
+          >
+            <Icon name="expand" size={18} tintColor={Colors.dark.text} />
+          </Pressable>
+        </Animated.View>
+      ) : null}
       {showLoadingConversation ? (
         <Animated.View
           key={`loading-${timelineKey}`}
@@ -201,26 +250,6 @@ export function MessageTimeline({
   );
 }
 
-function messageKeyExtractor(message: ChatMessage) {
-  return message.id;
-}
-
-function messageItemType(message: ChatMessage) {
-  if (message.kind === "plan") {
-    return "plan";
-  }
-  if (message.kind === "fileChange") {
-    return "protocol";
-  }
-  if (message.role === "status" || message.role === "tool" || message.role === "reasoning") {
-    return "meta";
-  }
-  if (message.kind !== "chat" && message.kind !== "unknown") {
-    return "protocol";
-  }
-  return message.role;
-}
-
 function LoadingConversation() {
   return (
     <View style={styles.empty} accessibilityRole="progressbar">
@@ -229,128 +258,6 @@ function LoadingConversation() {
         Loading conversation…
       </ThemedText>
     </View>
-  );
-}
-
-export function implementablePlanId(messages: ChatMessage[]) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (!message) {
-      continue;
-    }
-    if (isImplementablePlanMessage(message)) {
-      return message.id;
-    }
-    if (!isResolvedInputRequest(message)) {
-      return undefined;
-    }
-  }
-  return undefined;
-}
-
-function isImplementablePlanMessage(message: ChatMessage) {
-  return (
-    message.kind === "plan" && message.state !== "streaming" && Boolean(message.content.trim())
-  );
-}
-
-function isResolvedInputRequest(message: ChatMessage) {
-  if (message.kind !== "structuredUserInput") {
-    return false;
-  }
-  return (
-    message.details?.approvalResolved === true ||
-    typeof message.details?.approvalDecision === "string"
-  );
-}
-
-function RunningFooter() {
-  return (
-    <Animated.View entering={FadeIn.duration(180)} style={styles.runningFooter}>
-      <View style={styles.dots}>
-        <RunningDot delayMs={0} />
-        <RunningDot delayMs={RUNNING_DOT_STAGGER_MS} />
-        <RunningDot delayMs={RUNNING_DOT_STAGGER_MS * 2} />
-      </View>
-      <RunningLabel />
-    </Animated.View>
-  );
-}
-
-function RunningDot({ delayMs }: { delayMs: number }) {
-  const motionProgress = useSharedValue(0);
-  const pulseProgress = useSharedValue(0);
-  const animatedStyle = useAnimatedStyle(() => ({
-    opacity: 0.58 + pulseProgress.value * 0.32,
-    transform: [{ translateY: -2 * motionProgress.value }],
-  }));
-
-  useEffect(() => {
-    motionProgress.value = withDelay(
-      delayMs,
-      withRepeat(
-        withSequence(
-          withTiming(1, {
-            duration: RUNNING_PULSE_HALF_DURATION_MS,
-            easing: Easing.inOut(Easing.cubic),
-          }),
-          withTiming(0, {
-            duration: RUNNING_PULSE_HALF_DURATION_MS,
-            easing: Easing.inOut(Easing.cubic),
-          }),
-        ),
-        -1,
-        false,
-      ),
-    );
-    pulseProgress.value = withRepeat(
-      withSequence(
-        withTiming(1, {
-          duration: RUNNING_PULSE_HALF_DURATION_MS,
-          easing: Easing.inOut(Easing.cubic),
-        }),
-        withTiming(0, {
-          duration: RUNNING_PULSE_HALF_DURATION_MS,
-          easing: Easing.inOut(Easing.cubic),
-        }),
-      ),
-      -1,
-      false,
-    );
-  }, [delayMs, motionProgress, pulseProgress]);
-
-  return <Animated.View style={[styles.dot, animatedStyle]} />;
-}
-
-function RunningLabel() {
-  const progress = useSharedValue(0);
-  const animatedStyle = useAnimatedStyle(() => ({
-    opacity: 0.58 + progress.value * 0.32,
-  }));
-
-  useEffect(() => {
-    progress.value = withRepeat(
-      withSequence(
-        withTiming(1, {
-          duration: RUNNING_PULSE_HALF_DURATION_MS,
-          easing: Easing.inOut(Easing.cubic),
-        }),
-        withTiming(0, {
-          duration: RUNNING_PULSE_HALF_DURATION_MS,
-          easing: Easing.inOut(Easing.cubic),
-        }),
-      ),
-      -1,
-      false,
-    );
-  }, [progress]);
-
-  return (
-    <Animated.View style={animatedStyle}>
-      <ThemedText type="code" themeColor="textSecondary">
-        Working…
-      </ThemedText>
-    </Animated.View>
   );
 }
 
@@ -374,6 +281,31 @@ const styles = StyleSheet.create({
   list: {
     flex: 1,
   },
+  listEndPad: {
+    height: Spacing.two,
+  },
+  pressed: {
+    opacity: 0.7,
+  },
+  scrollToEndButton: {
+    alignItems: "center",
+    backgroundColor: "rgba(42, 42, 42, 0.94)",
+    borderColor: "rgba(255, 255, 255, 0.12)",
+    borderCurve: "continuous",
+    borderRadius: 18,
+    borderWidth: 1,
+    height: 36,
+    justifyContent: "center",
+    width: 36,
+  },
+  scrollToEndContainer: {
+    alignItems: "center",
+    bottom: Spacing.three,
+    left: 0,
+    position: "absolute",
+    right: 0,
+    zIndex: 2,
+  },
   transitionHost: {
     flex: 1,
     overflow: "hidden",
@@ -384,26 +316,5 @@ const styles = StyleSheet.create({
     position: "absolute",
     right: 0,
     top: 0,
-  },
-  listEndPad: {
-    height: Spacing.two,
-  },
-  runningFooter: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: Spacing.two,
-    justifyContent: "center",
-    paddingBottom: Spacing.four,
-    paddingTop: Spacing.two,
-  },
-  dots: {
-    flexDirection: "row",
-    gap: 3,
-  },
-  dot: {
-    backgroundColor: "rgba(176, 180, 186, 0.55)",
-    borderRadius: 3,
-    height: 6,
-    width: 6,
   },
 });

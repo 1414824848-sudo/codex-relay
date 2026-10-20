@@ -3,35 +3,42 @@ import "expo-dev-client";
 import "react-native-gesture-handler";
 
 import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
-import { HotUpdater } from "@hot-updater/react-native";
 import { PortalHost } from "@rn-primitives/portal";
 import { QueryClient } from "@tanstack/react-query";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import { useFonts } from "expo-font";
-import { Stack } from "expo-router";
+import * as Notifications from "expo-notifications";
+import { router, Stack } from "expo-router";
 import { DarkTheme, ThemeProvider } from "expo-router/react-navigation";
 import * as SplashScreen from "expo-splash-screen";
-import React, { useEffect, useState } from "react";
+import React, { useEffect } from "react";
 import { Text, TextInput } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 
 import { AnimatedSplashOverlay } from "@/components/animated-icon";
-import { AppToast } from "@/components/ui/toast";
-import { addHotUpdaterLog, formatHotUpdaterProgress } from "@/lib/hot-updater-logs";
+import { useInitialPushNotificationRegistration } from "@/hooks/use-initial-push-notification-registration";
+import { hotUpdater } from "@/lib/hot-updater";
+import {
+  addHotUpdaterLog,
+  formatHotUpdaterProgress,
+  hotUpdaterErrorDetails,
+} from "@/lib/hot-updater-logs";
+import {
+  configurePushNotificationPresentation,
+  notificationResponseThreadId,
+  supportsPushNotifications,
+} from "@/lib/push-notifications";
 import {
   persistedQueryMaxAgeMs,
   queryClientPersister,
   shouldPersistQuery,
 } from "@/lib/query-persistence";
 import { restoreChatStoreFromQueryCache } from "@/lib/server-state-hydration";
-import {
-  consumeInactiveSessionExpiredNotice,
-  inactiveSessionExpiredToastCopy,
-  subscribeInactiveSessionExpired,
-} from "@/lib/session-expiration";
+import { setActiveThread } from "@/state/chat-store";
 
 void SplashScreen.preventAutoHideAsync();
+configurePushNotificationPresentation();
 
 const appTheme = {
   ...DarkTheme,
@@ -75,20 +82,24 @@ TextInputWithDefaults.defaultProps = {
 };
 
 async function checkForLaunchUpdate() {
+  if (hotUpdater === null) {
+    addHotUpdaterLog("warning", "OTA launch check skipped", "No update server is configured.");
+    return;
+  }
   addHotUpdaterLog(
     "info",
     "OTA launch check started",
     [
-      `App version: ${HotUpdater.getAppVersion()}`,
-      `Channel: ${HotUpdater.getChannel()}`,
-      `Default channel: ${HotUpdater.getDefaultChannel()}`,
-      `Cohort: ${HotUpdater.getCohort()}`,
-      `Bundle: ${HotUpdater.getBundleId()}`,
-      `Min bundle: ${HotUpdater.getMinBundleId()}`,
+      `App version: ${hotUpdater.getAppVersion()}`,
+      `Channel: ${hotUpdater.getChannel()}`,
+      `Default channel: ${hotUpdater.getDefaultChannel()}`,
+      `Cohort: ${hotUpdater.getCohort()}`,
+      `Bundle: ${hotUpdater.getBundleId()}`,
+      `Min bundle: ${hotUpdater.getMinBundleId()}`,
     ].join("\n"),
   );
 
-  const updateInfo = await HotUpdater.checkForUpdate({
+  const updateInfo = await hotUpdater.checkForUpdate({
     updateStrategy: "appVersion",
     onError: (error) => {
       addHotUpdaterLog(
@@ -107,9 +118,12 @@ async function checkForLaunchUpdate() {
   addHotUpdaterLog(
     "info",
     "OTA launch check found update",
-    [`ID: ${updateInfo.id}`, `Status: ${updateInfo.status}`, `Message: ${updateInfo.message}`].join(
-      "\n",
-    ),
+    [
+      `ID: ${updateInfo.id}`,
+      `Status: ${updateInfo.status}`,
+      `Force update: ${updateInfo.shouldForceUpdate ? "yes" : "no"}`,
+      `Message: ${updateInfo.message}`,
+    ].join("\n"),
   );
 
   const didDownload = await updateInfo.updateBundle();
@@ -118,14 +132,20 @@ async function checkForLaunchUpdate() {
     "OTA launch update bundle finished",
     `Downloaded: ${didDownload ? "yes" : "no"}`,
   );
+
+  // A force update runs right away instead of waiting for the next launch.
+  if (didDownload && updateInfo.shouldForceUpdate) {
+    addHotUpdaterLog("info", "OTA force update reloading", `ID: ${updateInfo.id}`);
+    await hotUpdater.reload();
+  }
 }
 
 function TabLayout() {
+  useInitialPushNotificationRegistration();
   const [fontsLoaded] = useFonts({
     GeistMono: require("../../assets/fonts/GeistMono-Regular.ttf"),
     "GeistMono-Medium": require("../../assets/fonts/GeistMono-Medium.ttf"),
   });
-  const [inactiveSessionToastId, setInactiveSessionToastId] = useState<number | undefined>();
 
   useEffect(() => {
     if (fontsLoaded) {
@@ -134,24 +154,37 @@ function TabLayout() {
   }, [fontsLoaded]);
 
   useEffect(() => {
-    const unsubscribeProgress = HotUpdater.addListener("onProgress", (event) => {
+    const unsubscribeProgress = hotUpdater?.addListener("onProgress", (event) => {
       addHotUpdaterLog("info", "OTA download progress", formatHotUpdaterProgress(event));
     });
 
     void checkForLaunchUpdate().catch(() => undefined);
+    void refreshRemoteConfig();
 
-    return unsubscribeProgress;
+    return () => unsubscribeProgress?.();
   }, []);
 
   useEffect(() => {
-    const showInactiveSessionExpiredToast = () => {
-      if (consumeInactiveSessionExpiredNotice()) {
-        setInactiveSessionToastId((current) => (current ?? 0) + 1);
+    if (!supportsPushNotifications()) {
+      return;
+    }
+    const openNotificationThread = (response: Notifications.NotificationResponse) => {
+      const threadId = notificationResponseThreadId(response);
+      if (!threadId) {
+        return;
       }
+      setActiveThread(threadId);
+      router.replace("/");
+      Notifications.clearLastNotificationResponse();
     };
 
-    showInactiveSessionExpiredToast();
-    return subscribeInactiveSessionExpired(showInactiveSessionExpiredToast);
+    const mostRecentResponse = Notifications.getLastNotificationResponse();
+    if (mostRecentResponse) {
+      openNotificationThread(mostRecentResponse);
+    }
+    const subscription =
+      Notifications.addNotificationResponseReceivedListener(openNotificationThread);
+    return () => subscription.remove();
   }, []);
 
   if (!fontsLoaded) {
@@ -163,7 +196,7 @@ function TabLayout() {
       client={queryClient}
       onSuccess={() => restoreChatStoreFromQueryCache(queryClient)}
       persistOptions={{
-        buster: "codex-relay-server-state-v1",
+        buster: "codex-relay-server-state-v2",
         dehydrateOptions: {
           shouldDehydrateQuery: shouldPersistQuery,
         },
@@ -204,6 +237,13 @@ function TabLayout() {
                   }}
                 />
                 <Stack.Screen
+                  name="ssh"
+                  options={{
+                    animation: "slide_from_right",
+                    title: "SSH",
+                  }}
+                />
+                <Stack.Screen
                   name="workspace-file-editor"
                   options={{
                     animation: "slide_from_right",
@@ -212,15 +252,6 @@ function TabLayout() {
                 />
               </Stack>
               <PortalHost />
-              {inactiveSessionToastId ? (
-                <AppToast
-                  key={`inactive-session-expired-${inactiveSessionToastId}`}
-                  title={inactiveSessionExpiredToastCopy.title}
-                  message={inactiveSessionExpiredToastCopy.message}
-                  visible
-                  onDismiss={() => setInactiveSessionToastId(undefined)}
-                />
-              ) : null}
             </BottomSheetModalProvider>
           </KeyboardProvider>
         </GestureHandlerRootView>
@@ -229,12 +260,26 @@ function TabLayout() {
   );
 }
 
-const hotUpdaterBaseUrl = process.env.EXPO_PUBLIC_HOT_UPDATER_BASE_URL?.trim();
-
-if (hotUpdaterBaseUrl) {
-  HotUpdater.init({
-    baseURL: hotUpdaterBaseUrl,
-  });
+/** Applies the Remote Config values the server picks, at most every 12 hours. */
+async function refreshRemoteConfig() {
+  // Absent when the plugin could not set up, such as on a binary without its storage.
+  const remoteConfig = hotUpdater?.remoteConfig;
+  if (!remoteConfig) {
+    return;
+  }
+  try {
+    const activated = await remoteConfig.fetchAndActivate();
+    addHotUpdaterLog(
+      "info",
+      "Remote Config fetched",
+      [
+        `Activated: ${activated ? "new values" : "no change"}`,
+        `Version: ${remoteConfig.activeVersion}`,
+      ].join("\n"),
+    );
+  } catch (error) {
+    addHotUpdaterLog("warning", "Remote Config fetch failed", hotUpdaterErrorDetails(error));
+  }
 }
 
 export default TabLayout;

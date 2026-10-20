@@ -8,6 +8,7 @@ import type {
   PendingInputRequest,
   RateLimitBucket,
   ThreadCollaborationMode,
+  ThreadGoal,
 } from "codex-relay/api-schema";
 import { promptSkillMentionLabel, promptSkillMentionTextCandidates } from "codex-relay/api-schema";
 import { Image } from "expo-image";
@@ -22,7 +23,13 @@ import {
   type ReactNode,
   type Ref,
 } from "react";
-import { Pressable, TextInput, View, type LayoutChangeEvent } from "react-native";
+import {
+  Pressable,
+  TextInput,
+  View,
+  type LayoutChangeEvent,
+  type TextInputInstance,
+} from "react-native";
 import {
   EnrichedMarkdownTextInput,
   type EnrichedMarkdownTextInputInstance,
@@ -42,9 +49,13 @@ import Animated, {
 import Svg, { Circle } from "react-native-svg";
 import { StyleSheet } from "react-native-unistyles";
 
-import { AppBottomSheet, SheetActionRow } from "@/components/ui/bottom-sheet";
+import {
+  AppBottomSheet,
+  AppBottomSheetTextInput,
+  SheetActionRow,
+} from "@/components/ui/bottom-sheet";
 import { Button } from "@/components/ui/button";
-import { Icon } from "@/components/ui/icon";
+import { Icon, type AppIconName } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { Fonts } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
@@ -72,6 +83,13 @@ const PLAN_COMPOSER_PLACEHOLDER = "Ask Codex for a plan. Try $skills or @files."
 const SUGGESTION_ROW_ESTIMATED_SIZE = 44;
 const SUGGESTION_LIST_GAP = 2;
 const SUGGESTION_LIST_MAX_HEIGHT = 270;
+const QUEUE_LEADING_SLOT_SIZE = 28;
+const QUEUE_CONTENT_GAP = 8;
+const QUEUE_STEER_BUTTON_WIDTH = 80;
+const QUEUE_ICON_BUTTON_SIZE = 28;
+const QUEUE_ACTION_GAP = 6;
+const QUEUE_ACTIONS_WIDTH =
+  QUEUE_STEER_BUTTON_WIDTH + QUEUE_ICON_BUTTON_SIZE * 2 + QUEUE_ACTION_GAP * 2;
 const MENTION_INPUT_MARKDOWN_STYLE = {
   link: {
     color: "#7CC7FF",
@@ -220,6 +238,7 @@ export const ChatComposer = memo(function ChatComposer({
   inputEditable,
   isAttachingImage,
   isRunning,
+  goal,
   nativeID,
   pendingInputRequest,
   planConfirmationId,
@@ -240,6 +259,9 @@ export const ChatComposer = memo(function ChatComposer({
   onRestoreQueuedPrompt,
   onSend,
   onSteerQueuedPrompt,
+  onClearGoal,
+  onSaveGoal,
+  onToggleGoalPause,
   rateLimitBuckets,
   skills,
   skillsLoadState,
@@ -254,6 +276,7 @@ export const ChatComposer = memo(function ChatComposer({
   inputEditable?: boolean;
   isAttachingImage: boolean;
   isRunning: boolean;
+  goal?: ThreadGoal | null;
   nativeID?: string;
   pendingInputRequest?: PendingInputRequest;
   planConfirmationId?: string;
@@ -274,6 +297,9 @@ export const ChatComposer = memo(function ChatComposer({
   onRestoreQueuedPrompt?: (item: QueuedComposerPrompt) => void;
   onSend: () => void;
   onSteerQueuedPrompt?: (item: QueuedComposerPrompt) => void;
+  onClearGoal?: () => void;
+  onSaveGoal?: (objective: string) => void;
+  onToggleGoalPause?: () => void;
   rateLimitBuckets: RateLimitBucket[];
   skills: AgentSkill[];
   skillsLoadState: "idle" | "loading" | "loaded" | "failed";
@@ -960,11 +986,15 @@ export const ChatComposer = memo(function ChatComposer({
           onSelectSkill={selectSkill}
         />
       ) : (
-        <QueuedPromptPanel
+        <ComposerTopAccessoryPanel
+          goal={goal}
           queuedPrompts={queuedPrompts}
           textColor={theme.text}
           textSecondaryColor={theme.textSecondary}
           onHeightChange={onQueuedPromptPanelHeightChange}
+          onClearGoal={onClearGoal}
+          onSaveGoal={onSaveGoal}
+          onToggleGoalPause={onToggleGoalPause}
           onRemoveQueuedPrompt={onRemoveQueuedPrompt}
           onRestoreQueuedPrompt={onRestoreQueuedPrompt}
           onSteerQueuedPrompt={onSteerQueuedPrompt}
@@ -1378,8 +1408,12 @@ function fileSuggestionKeyExtractor(file: WorkspaceFileMention) {
   return `${file.kind}:${file.path}`;
 }
 
-const QueuedPromptPanel = memo(function QueuedPromptPanel({
+const ComposerTopAccessoryPanel = memo(function ComposerTopAccessoryPanel({
+  goal,
   onHeightChange,
+  onClearGoal,
+  onSaveGoal,
+  onToggleGoalPause,
   onRemoveQueuedPrompt,
   onRestoreQueuedPrompt,
   onSteerQueuedPrompt,
@@ -1387,7 +1421,11 @@ const QueuedPromptPanel = memo(function QueuedPromptPanel({
   textColor,
   textSecondaryColor,
 }: {
+  goal?: ThreadGoal | null;
   onHeightChange?: (height: number) => void;
+  onClearGoal?: () => void;
+  onSaveGoal?: (objective: string) => void;
+  onToggleGoalPause?: () => void;
   onRemoveQueuedPrompt?: (item: QueuedComposerPrompt) => void;
   onRestoreQueuedPrompt?: (item: QueuedComposerPrompt) => void;
   onSteerQueuedPrompt?: (item: QueuedComposerPrompt) => void;
@@ -1395,95 +1433,223 @@ const QueuedPromptPanel = memo(function QueuedPromptPanel({
   textColor: string;
   textSecondaryColor: string;
 }) {
+  const [isEditingGoal, setEditingGoal] = useState(false);
+  const [goalDraft, setGoalDraft] = useState(goal?.objective ?? "");
+  const trimmedGoalDraft = goalDraft.trim();
+  const canSaveGoalDraft = Boolean(trimmedGoalDraft && trimmedGoalDraft !== goal?.objective);
+  const canToggleGoalPause = goal ? isGoalPauseToggleVisible(goal.status) : false;
+
   useEffect(() => {
-    if (queuedPrompts.length === 0) {
+    if (!isEditingGoal) {
+      setGoalDraft(goal?.objective ?? "");
+    }
+  }, [goal?.objective, isEditingGoal]);
+
+  useEffect(() => {
+    if (!goal) {
+      setEditingGoal(false);
+    }
+  }, [goal]);
+
+  useEffect(() => {
+    if (!goal && queuedPrompts.length === 0) {
       onHeightChange?.(0);
     }
-  }, [onHeightChange, queuedPrompts.length]);
+  }, [goal, onHeightChange, queuedPrompts.length]);
 
   function handleLayout(event: LayoutChangeEvent) {
     onHeightChange?.(event.nativeEvent.layout.height);
   }
 
-  if (queuedPrompts.length === 0) {
+  if (!goal && queuedPrompts.length === 0) {
     return null;
   }
 
+  function saveGoalDraft() {
+    if (!trimmedGoalDraft || trimmedGoalDraft === goal?.objective) {
+      closeGoalEditor();
+      return;
+    }
+    onSaveGoal?.(trimmedGoalDraft);
+    setEditingGoal(false);
+  }
+
+  function closeGoalEditor() {
+    setEditingGoal(false);
+    setGoalDraft(goal?.objective ?? "");
+  }
+
   return (
-    <Animated.View
-      entering={FadeIn.duration(120)}
-      layout={LinearTransition.duration(140)}
-      onLayout={handleLayout}
-      style={[
-        styles.queuePanel,
-        {
-          backgroundColor: "rgba(28, 28, 30, 0.98)",
-          borderColor: "rgba(255, 255, 255, 0.14)",
-        },
-      ]}
-    >
-      {queuedPrompts.map((item, index) => {
-        const itemSkills = item.skills ?? [];
-        return (
-          <View key={item.id} style={styles.queueRow}>
-            <View style={styles.queuePromptGroup}>
-              <Icon name="chevronRight" size={12} tintColor={textSecondaryColor} />
-              <View style={styles.queuePromptBody}>
-                <View style={styles.queuePromptMarkdown}>
-                  <PromptMarkdownText
-                    color={textColor}
-                    fontSize={12}
-                    lineHeight={16}
-                    markdownStyle={queuePromptMarkdownStyle}
-                    prompt={item.prompt}
-                    skills={itemSkills}
-                  />
+    <>
+      <Animated.View
+        entering={FadeIn.duration(120)}
+        layout={LinearTransition.duration(140)}
+        onLayout={handleLayout}
+        style={[
+          styles.queuePanel,
+          {
+            backgroundColor: "rgba(28, 28, 30, 0.98)",
+            borderColor: "rgba(255, 255, 255, 0.14)",
+          },
+        ]}
+      >
+        {queuedPrompts.map((item, index) => {
+          const itemSkills = item.skills ?? [];
+          return (
+            <View key={item.id} style={styles.queueRow}>
+              <View style={styles.queuePromptGroup}>
+                <View style={styles.queuePromptIconSlot}>
+                  <Icon name="chevronRight" size={12} tintColor={textSecondaryColor} />
+                </View>
+                <View style={styles.queuePromptBody}>
+                  <View style={styles.queuePromptMarkdown}>
+                    <PromptMarkdownText
+                      color={textColor}
+                      fontSize={12}
+                      lineHeight={16}
+                      markdownStyle={queuePromptMarkdownStyle}
+                      prompt={item.prompt}
+                      skills={itemSkills}
+                    />
+                  </View>
                 </View>
               </View>
+              <View style={styles.queueActions}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Steer queued prompt ${index + 1}`}
+                  hitSlop={6}
+                  onPress={() => {
+                    hapticMediumImpact();
+                    onSteerQueuedPrompt?.(item);
+                  }}
+                  style={styles.queueSteerButton}
+                >
+                  {({ pressed }) => (
+                    <View style={[styles.queueSteerPill, pressed && styles.queueSteerPillPressed]}>
+                      <Icon name="sendToLine" size={12} tintColor={textColor} />
+                      <Text
+                        numberOfLines={1}
+                        style={[styles.queueActionText, { color: textColor }]}
+                      >
+                        Steering
+                      </Text>
+                    </View>
+                  )}
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Restore queued prompt ${index + 1} to composer`}
+                  hitSlop={6}
+                  onPress={() => {
+                    hapticSelection();
+                    onRestoreQueuedPrompt?.(item);
+                  }}
+                  style={styles.queueIconButton}
+                >
+                  {({ pressed }) => (
+                    <View
+                      style={[styles.queueIconCircle, pressed && styles.queueIconCirclePressed]}
+                    >
+                      <Icon name="expand" size={13} tintColor={textColor} />
+                    </View>
+                  )}
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Remove queued prompt ${index + 1}`}
+                  hitSlop={6}
+                  onPress={() => {
+                    hapticWarning();
+                    onRemoveQueuedPrompt?.(item);
+                  }}
+                  style={styles.queueIconButton}
+                >
+                  {({ pressed }) => (
+                    <View
+                      style={[styles.queueIconCircle, pressed && styles.queueIconCirclePressed]}
+                    >
+                      <Icon name="trash" size={13} tintColor={textColor} />
+                    </View>
+                  )}
+                </Pressable>
+              </View>
             </View>
-            <View style={styles.queueActions}>
+          );
+        })}
+        {goal ? (
+          <View style={styles.goalRow}>
+            <View style={styles.goalPromptGroup}>
+              <View style={styles.goalStatusIconSlot}>
+                <Icon
+                  name={goalStatusIconName(goal.status)}
+                  size={16}
+                  tintColor={goalStatusTintColor(goal.status)}
+                />
+              </View>
+              <View style={styles.goalPromptBody}>
+                <View style={styles.goalTitleRow}>
+                  <Text numberOfLines={1} style={[styles.goalLabel, { color: textSecondaryColor }]}>
+                    Goal
+                  </Text>
+                  <Text numberOfLines={1} style={[styles.goalMeta, { color: textSecondaryColor }]}>
+                    {goalStatusMeta(goal)}
+                  </Text>
+                </View>
+                <Text numberOfLines={1} style={[styles.goalObjective, { color: textColor }]}>
+                  {goal.objective}
+                </Text>
+              </View>
+            </View>
+            <View style={[styles.goalActions, !canToggleGoalPause && styles.goalActionsCompact]}>
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel={`Steer queued prompt ${index + 1}`}
-                hitSlop={6}
-                onPress={() => {
-                  hapticMediumImpact();
-                  onSteerQueuedPrompt?.(item);
-                }}
-                style={styles.queueSteerButton}
-              >
-                {({ pressed }) => (
-                  <View style={[styles.queueSteerPill, pressed && styles.queueSteerPillPressed]}>
-                    <Icon name="sendToLine" size={12} tintColor={textColor} />
-                    <Text numberOfLines={1} style={[styles.queueActionText, { color: textColor }]}>
-                      Steering
-                    </Text>
-                  </View>
-                )}
-              </Pressable>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel={`Restore queued prompt ${index + 1} to composer`}
+                accessibilityLabel="Edit goal"
                 hitSlop={6}
                 onPress={() => {
                   hapticSelection();
-                  onRestoreQueuedPrompt?.(item);
+                  setGoalDraft(goal.objective);
+                  setEditingGoal(true);
                 }}
                 style={styles.queueIconButton}
               >
                 {({ pressed }) => (
                   <View style={[styles.queueIconCircle, pressed && styles.queueIconCirclePressed]}>
-                    <Icon name="expand" size={13} tintColor={textColor} />
+                    <Icon name="newChat" size={13} tintColor={textColor} />
                   </View>
                 )}
               </Pressable>
+              {canToggleGoalPause ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={goal.status === "paused" ? "Resume goal" : "Pause goal"}
+                  hitSlop={6}
+                  onPress={() => {
+                    hapticMediumImpact();
+                    onToggleGoalPause?.();
+                  }}
+                  style={styles.queueIconButton}
+                >
+                  {({ pressed }) => (
+                    <View
+                      style={[styles.queueIconCircle, pressed && styles.queueIconCirclePressed]}
+                    >
+                      <Icon
+                        name={goal.status === "paused" ? "sendToLine" : "stop"}
+                        size={13}
+                        tintColor={textColor}
+                      />
+                    </View>
+                  )}
+                </Pressable>
+              ) : null}
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel={`Remove queued prompt ${index + 1}`}
+                accessibilityLabel="Clear goal"
                 hitSlop={6}
                 onPress={() => {
                   hapticWarning();
-                  onRemoveQueuedPrompt?.(item);
+                  onClearGoal?.();
                 }}
                 style={styles.queueIconButton}
               >
@@ -1495,9 +1661,62 @@ const QueuedPromptPanel = memo(function QueuedPromptPanel({
               </Pressable>
             </View>
           </View>
-        );
-      })}
-    </Animated.View>
+        ) : null}
+      </Animated.View>
+      <AppBottomSheet
+        expandedSnapPercent={52}
+        title="Edit goal"
+        onClose={closeGoalEditor}
+        scrollable={false}
+        visible={Boolean(goal && isEditingGoal)}
+      >
+        <View style={styles.goalEditSheet}>
+          <AppBottomSheetTextInput
+            autoCapitalize="sentences"
+            autoCorrect
+            cursorColor={textColor}
+            multiline
+            onChangeText={setGoalDraft}
+            onSubmitEditing={saveGoalDraft}
+            placeholder="Goal objective"
+            placeholderTextColor={textSecondaryColor}
+            returnKeyType="done"
+            selectionColor="rgba(124, 199, 255, 0.28)"
+            style={[
+              styles.goalEditSheetInput,
+              {
+                borderColor: "rgba(255, 255, 255, 0.14)",
+                color: textColor,
+              },
+            ]}
+            textAlignVertical="top"
+            value={goalDraft}
+          />
+          <View style={styles.goalEditSheetActions}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Cancel goal edit"
+              onPress={closeGoalEditor}
+              style={({ pressed }) => [styles.planDismissButton, pressed && styles.pressed]}
+            >
+              <Text style={[styles.goalEditCancelText, { color: textSecondaryColor }]}>Cancel</Text>
+            </Pressable>
+            <Button
+              accessibilityRole="button"
+              accessibilityLabel="Save goal"
+              disabled={!canSaveGoalDraft}
+              onPress={saveGoalDraft}
+              style={[
+                styles.planSubmitButton,
+                !canSaveGoalDraft && styles.goalEditSaveButtonDisabled,
+              ]}
+            >
+              <Text style={styles.planSubmitText}>Save</Text>
+            </Button>
+          </View>
+        </View>
+      </AppBottomSheet>
+    </>
   );
 });
 
@@ -1532,7 +1751,7 @@ function PlanDecisionPanel({
   selectedDecision: "context" | "implement";
 }) {
   const theme = useTheme();
-  const contextInputRef = useRef<TextInput | null>(null);
+  const contextInputRef = useRef<TextInputInstance | null>(null);
   const canSubmit = selectedDecision === "implement" || Boolean(contextDraft.trim());
 
   function selectContextDecision() {
@@ -1650,7 +1869,7 @@ function InputRequestPanel({
   selectedOption?: string;
 }) {
   const theme = useTheme();
-  const answerInputRef = useRef<TextInput | null>(null);
+  const answerInputRef = useRef<TextInputInstance | null>(null);
   const question = request.questions[questionIndex];
   const options = question?.options ?? [];
   const canSubmit = !question || Boolean(selectedOption || answerDraft.trim());
@@ -1820,7 +2039,7 @@ const PlanContextInputRow = memo(function PlanContextInputRow({
   onFocus: () => void;
   onPress: () => void;
   onSelect?: () => void;
-  ref?: Ref<TextInput>;
+  ref?: Ref<TextInputInstance>;
   selected: boolean;
   textColor: string;
   textSecondaryColor: string;
@@ -2597,6 +2816,79 @@ function markdownToPlainText(markdown: string) {
     .replace(/\\([\\[\]])/g, "$1");
 }
 
+function formatGoalElapsed(totalSeconds: number) {
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts = [
+    days > 0 ? `${days}d` : undefined,
+    hours > 0 || days > 0 ? `${hours}h` : undefined,
+    minutes > 0 || hours > 0 || days > 0 ? `${minutes}m` : undefined,
+    `${seconds}s`,
+  ];
+  return parts.filter(Boolean).join(" ");
+}
+
+function goalStatusMeta(goal: ThreadGoal) {
+  switch (goal.status) {
+    case "active":
+      return formatGoalElapsed(goal.timeUsedSeconds);
+    case "paused":
+      return "Paused";
+    case "complete":
+      return `Complete ${formatGoalElapsed(goal.timeUsedSeconds)}`;
+    case "blocked":
+      return "Blocked";
+    case "usageLimited":
+      return "Usage limited";
+    case "budgetLimited":
+      return "Budget limited";
+    default:
+      return assertNever(goal.status);
+  }
+}
+
+function goalStatusIconName(status: ThreadGoal["status"]): AppIconName {
+  switch (status) {
+    case "active":
+    case "complete":
+      return "goal";
+    case "paused":
+      return "stop";
+    case "blocked":
+    case "usageLimited":
+    case "budgetLimited":
+      return "warning";
+    default:
+      return assertNever(status);
+  }
+}
+
+function goalStatusTintColor(status: ThreadGoal["status"]) {
+  switch (status) {
+    case "active":
+    case "complete":
+      return "#8EE6B1";
+    case "paused":
+      return "#F8C66A";
+    case "blocked":
+    case "usageLimited":
+    case "budgetLimited":
+      return "#FFB36B";
+    default:
+      return assertNever(status);
+  }
+}
+
+function isGoalPauseToggleVisible(status: ThreadGoal["status"]) {
+  return status === "active" || status === "paused";
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled value: ${String(value)}`);
+}
+
 function sameSkillSelection(left: AgentSkill[], right: AgentSkill[]) {
   return (
     left.length === right.length && left.every((skill, index) => skill.id === right[index]?.id)
@@ -2755,20 +3047,115 @@ const styles = StyleSheet.create({
     bottom: "100%",
     transform: [{ translateY: 6 }],
     zIndex: 2,
-    width: "80%",
+    width: "86%",
   },
   queueRow: {
     alignItems: "center",
     flexDirection: "row",
-    gap: 12,
+    gap: 14,
     minHeight: 38,
   },
-  queuePromptGroup: {
-    alignItems: "flex-start",
+  goalRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 10,
+    minHeight: 44,
+  },
+  goalPromptGroup: {
+    alignItems: "center",
     flex: 1,
     flexDirection: "row",
-    gap: 6,
+    gap: QUEUE_CONTENT_GAP,
     minWidth: 0,
+  },
+  goalStatusIconSlot: {
+    alignItems: "center",
+    height: QUEUE_LEADING_SLOT_SIZE,
+    justifyContent: "center",
+    width: QUEUE_LEADING_SLOT_SIZE,
+  },
+  goalPromptBody: {
+    flex: 1,
+    gap: 3,
+    justifyContent: "center",
+    minWidth: 0,
+  },
+  goalTitleRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 8,
+    minWidth: 0,
+  },
+  goalLabel: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 11,
+    includeFontPadding: false,
+    lineHeight: 14,
+  },
+  goalMeta: {
+    flexShrink: 0,
+    fontFamily: Fonts.mono,
+    fontSize: 10,
+    includeFontPadding: false,
+    lineHeight: 13,
+  },
+  goalObjective: {
+    fontFamily: Fonts.sansMedium,
+    fontSize: 12,
+    includeFontPadding: false,
+    lineHeight: 16,
+  },
+  goalActions: {
+    alignItems: "center",
+    flexDirection: "row",
+    flexShrink: 0,
+    gap: 6,
+    height: 28,
+    justifyContent: "flex-end",
+    width: 96,
+  },
+  goalActionsCompact: {
+    width: 62,
+  },
+  goalEditSheet: {
+    gap: 14,
+  },
+  goalEditSheetInput: {
+    borderRadius: 12,
+    borderWidth: 1,
+    fontFamily: Fonts.sansMedium,
+    fontSize: 15,
+    height: 136,
+    lineHeight: 21,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  goalEditSheetActions: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 10,
+    justifyContent: "flex-end",
+  },
+  goalEditCancelText: {
+    fontFamily: Fonts.sansSemiBold,
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  goalEditSaveButtonDisabled: {
+    opacity: 0.45,
+  },
+  queuePromptGroup: {
+    alignItems: "center",
+    flex: 1,
+    flexDirection: "row",
+    gap: QUEUE_CONTENT_GAP,
+    minWidth: 0,
+  },
+  queuePromptIconSlot: {
+    alignItems: "center",
+    height: QUEUE_LEADING_SLOT_SIZE,
+    justifyContent: "center",
+    width: QUEUE_LEADING_SLOT_SIZE,
   },
   queuePromptBody: {
     flex: 1,
@@ -2780,15 +3167,16 @@ const styles = StyleSheet.create({
     minWidth: 0,
     opacity: 0.88,
     overflow: "hidden",
+    paddingRight: 2,
   },
   queueActions: {
     alignItems: "center",
     flexShrink: 0,
     flexDirection: "row",
-    gap: 8,
+    gap: QUEUE_ACTION_GAP,
     justifyContent: "flex-end",
     height: 34,
-    width: 154,
+    width: QUEUE_ACTIONS_WIDTH,
   },
   queueSteerButton: {
     alignItems: "center",
@@ -2796,8 +3184,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     height: 28,
     justifyContent: "center",
-    paddingHorizontal: 8,
-    width: 82,
+    width: QUEUE_STEER_BUTTON_WIDTH,
   },
   queueSteerPill: {
     alignItems: "center",
@@ -2809,7 +3196,7 @@ const styles = StyleSheet.create({
     gap: 4,
     height: 28,
     justifyContent: "center",
-    width: 82,
+    width: QUEUE_STEER_BUTTON_WIDTH,
   },
   queueSteerPillPressed: {
     backgroundColor: "rgba(255, 255, 255, 0.22)",
@@ -2827,9 +3214,9 @@ const styles = StyleSheet.create({
   queueIconButton: {
     alignItems: "center",
     flexShrink: 0,
-    height: 28,
+    height: QUEUE_ICON_BUTTON_SIZE,
     justifyContent: "center",
-    width: 28,
+    width: QUEUE_ICON_BUTTON_SIZE,
   },
   queueIconCircle: {
     alignItems: "center",
@@ -2837,9 +3224,9 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255, 255, 255, 0.2)",
     borderRadius: 10,
     borderWidth: 1,
-    height: 28,
+    height: QUEUE_ICON_BUTTON_SIZE,
     justifyContent: "center",
-    width: 28,
+    width: QUEUE_ICON_BUTTON_SIZE,
   },
   queueIconCirclePressed: {
     backgroundColor: "rgba(255, 255, 255, 0.2)",
@@ -3028,13 +3415,13 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
     flex: 1,
-    height: 40,
+    height: 44,
     minWidth: 0,
   },
   footerRow: {
     alignItems: "stretch",
     flex: 1,
-    height: 40,
+    height: 44,
     justifyContent: "center",
     minWidth: 0,
   },

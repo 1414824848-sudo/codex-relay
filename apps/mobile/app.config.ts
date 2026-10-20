@@ -1,17 +1,25 @@
 import type { ConfigContext, ExpoConfig } from "expo/config";
+import { config } from "dotenv";
+
+config({ path: ".env.hotupdater.rc22", quiet: true });
+
+const hotUpdaterApiKey =
+  process.env.EXPO_PUBLIC_HOT_UPDATER_API_KEY?.trim() || process.env.HOT_UPDATER_API_KEY?.trim();
 
 export default function appConfig(_context: ConfigContext): ExpoConfig {
   return {
     name: "Codex Relay",
     slug: "codex-relay",
-    version: "1.1.0",
-    orientation: "portrait",
+    version: "1.6.2",
+    orientation: "default",
     icon: "./assets/images/icon.png",
     scheme: "codex-relay",
     userInterfaceStyle: "automatic",
     ios: {
       icon: "./assets/images/icon.png",
       bundleIdentifier: "com.gronstudio.codexrelay",
+      deploymentTarget: "16.4",
+      supportsTablet: true,
       infoPlist: {
         NSAppTransportSecurity: {
           NSAllowsArbitraryLoads: true,
@@ -20,6 +28,12 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
         ITSAppUsesNonExemptEncryption: false,
         NSLocalNetworkUsageDescription:
           "Codex Relay uses the local network to connect this device to the Codex Relay server running on your computer.",
+        "UISupportedInterfaceOrientations~ipad": [
+          "UIInterfaceOrientationPortrait",
+          "UIInterfaceOrientationPortraitUpsideDown",
+          "UIInterfaceOrientationLandscapeLeft",
+          "UIInterfaceOrientationLandscapeRight",
+        ],
       },
     },
     android: {
@@ -30,7 +44,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       },
       predictiveBackGestureEnabled: false,
       package: "com.gronstudio.codexrelay",
-      permissions: ["android.permission.CAMERA"],
+      permissions: ["android.permission.CAMERA", "android.permission.POST_NOTIFICATIONS"],
     },
     web: {
       output: "static",
@@ -76,10 +90,16 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       ],
       "expo-font",
       "expo-image",
+      "expo-notifications",
       "expo-system-ui",
       "expo-web-browser",
-      "@hot-updater/react-native",
-      "react-native-enriched-markdown",
+      [
+        "@hot-updater/expo",
+        {
+          channel: "production",
+          publicKeyPath: "./keys/public-key.pem",
+        },
+      ],
       [
         "expo-secure-store",
         {
@@ -89,9 +109,6 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       [
         "expo-build-properties",
         {
-          ios: {
-            deploymentTarget: "16.4",
-          },
           android: {
             usesCleartextTraffic: true,
           },
@@ -103,6 +120,7 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
       reactCompiler: true,
     },
     extra: {
+      hotUpdaterApiKey,
       router: {},
       eas: {
         projectId: "6659e28f-2ac7-4055-8f56-7b4ca5e65847",

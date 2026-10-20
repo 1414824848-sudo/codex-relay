@@ -7,6 +7,11 @@ import pc from "picocolors";
 import qrcode from "qrcode-terminal";
 
 import { createApp } from "./app.js";
+import { CodexAppServerClient } from "./app-server.js";
+import {
+  resolveCodexAppServerMode,
+  resolveCodexSharedAppServerRemoteAddress,
+} from "./codex-binary.js";
 import { isRelayDebugEnabled, relayDebugLog } from "./debug-log.js";
 import {
   createPairingQrPayload,
@@ -15,6 +20,7 @@ import {
   type ConnectUrlCandidate,
 } from "./pairing-url-candidates.js";
 import { createTursoPairingSessionStore } from "./pairing-store.js";
+import { createTerminalPairingApprover } from "./terminal-pairing.js";
 import { codexRelayDataPath, legacyCodexRelayDataPath } from "./paths.js";
 import { createFileRuntimePreferencesStore } from "./preferences-store.js";
 import {
@@ -24,8 +30,8 @@ import {
 } from "./secure-transport.js";
 
 const port = Number(process.env.PORT ?? 8787);
+let activePort = port;
 const hostname = process.env.HOST ?? "0.0.0.0";
-const clientTokenTtlMs = 7 * 24 * 60 * 60 * 1000;
 const dangerouslyAutoApprove = process.env.CODEX_RELAY_DANGEROUSLY_AUTO_APPROVE === "1";
 const serverIdentity = await getServerIdentity();
 const approvalSecret = await getApprovalSecret();
@@ -52,13 +58,40 @@ const sessionStore = await createTursoPairingSessionStore(
   process.env.CODEX_RELAY_AUTH_DB_PATH ??
     (await prepareCodexRelayDataPath("auth.db", ["auth.db-shm", "auth.db-wal"])),
 );
+const terminalPairing = createTerminalPairingApprover({
+  input: process.stdin,
+  output: process.stdout,
+  sessions: sessionStore,
+  onApproved: () =>
+    logRuntimeEvent("Approved", "Pairing approved. Waiting for your phone to finish connecting."),
+});
 const preferencesStore = createFileRuntimePreferencesStore(
   process.env.CODEX_RELAY_PREFERENCES_PATH ?? (await prepareCodexRelayDataPath("preferences.json")),
 );
+const appServerMode = resolveCodexAppServerMode();
+const relayAppServer =
+  appServerMode.mode === "socket"
+    ? new CodexAppServerClient({
+        mode: appServerMode,
+        onStartupFallback: (error) => {
+          logRuntimeEvent(
+            "Fallback",
+            `Shared app-server unavailable; continuing with a private app-server (${error.message}).`,
+          );
+        },
+      })
+    : undefined;
+if (relayAppServer) {
+  await relayAppServer.initialize();
+  process.once("SIGINT", () => stopRelayAppServer(130));
+  process.once("SIGTERM", () => stopRelayAppServer(143));
+  process.once("exit", () => relayAppServer.close());
+}
 
 serve(
   {
     fetch: createApp({
+      appServer: relayAppServer,
       pairing: {
         approvalSecret,
         dangerouslyAutoApprove,
@@ -66,7 +99,6 @@ serve(
         createClientToken: () => randomBytes(32).toString("base64url"),
         hashClientToken,
         sessions: sessionStore,
-        tokenTtlMs: clientTokenTtlMs,
         onPaired: ({ clientName, tokenCount }) => {
           const name = clientName ? ` from ${clientName}` : "";
           logRuntimeEvent(
@@ -80,12 +112,13 @@ serve(
             `Handshake received${remoteAddress ? ` from ${remoteAddress}` : ""}.`,
           );
         },
-        onPairApprovalRequested: ({ clientName }) => {
+        onPairApprovalRequested: ({ approvalCode, clientName }) => {
           const name = clientName ? ` from ${clientName}` : "";
           logRuntimeEvent(
             "Approval",
-            `Pairing approval requested${name}. Use the code shown in the mobile app to approve locally.`,
+            `Pairing approval requested${name}. Command: ${formatApprovalCommand(approvalCode, activePort)}`,
           );
+          void terminalPairing.request(approvalCode);
         },
         onPairApproved: ({ clientName }) => {
           const name = clientName ? ` for ${clientName}` : "";
@@ -114,6 +147,7 @@ serve(
     port,
   },
   (info) => {
+    activePort = info.port;
     const listenUrl = `http://${info.address}:${info.port}`;
     const connectUrlCandidates = getConnectUrlCandidates({ listenUrl, port: info.port });
     const connectUrl = connectUrlCandidates[0]?.url ?? listenUrl;
@@ -152,10 +186,34 @@ serve(
         listenUrl,
         pairingPayload,
         port: info.port,
+        sharedAppServerRemoteAddress:
+          relayAppServer?.appServerMode === "socket"
+            ? resolveCodexSharedAppServerRemoteAddress()
+            : undefined,
       }),
     );
   },
-);
+).on("error", (error: NodeJS.ErrnoException) => {
+  if (error.code !== "EADDRINUSE") {
+    throw error;
+  }
+
+  console.error(`Codex Relay could not start: ${hostname}:${port} is already in use.`);
+  console.error("Another Codex Relay instance or another application may be listening there.");
+  console.error("If it is your existing relay, print its pairing QR with:");
+  console.error(`  ${npxCommand} qr`);
+  console.error("To stop a background relay using this data directory:");
+  console.error(`  ${npxCommand} stop`);
+  console.error("Otherwise, identify the listener before stopping it:");
+  console.error(`  lsof -nP -iTCP:${port} -sTCP:LISTEN`);
+  console.error("To run a separate relay, use a free PORT and a separate CODEX_RELAY_HOME.");
+  stopRelayAppServer(1);
+});
+
+function stopRelayAppServer(exitCode: number) {
+  relayAppServer?.close();
+  process.exit(exitCode);
+}
 
 function formatStartupInstructions(details: {
   connectUrl: string;
@@ -164,6 +222,7 @@ function formatStartupInstructions(details: {
   listenUrl: string;
   pairingPayload: string;
   port: number;
+  sharedAppServerRemoteAddress?: string;
 }) {
   const lines = [
     `${color.prompt("›")} Scan the QR code above to pair ${color.brand("Codex Relay mobile")}.`,
@@ -174,10 +233,18 @@ function formatStartupInstructions(details: {
     `${color.prompt("›")} Server: ${color.muted(details.listenUrl)}`,
     "",
     `${color.prompt("›")} Pairing: ${color.url(details.pairingPayload)}`,
+    ...(details.sharedAppServerRemoteAddress
+      ? [
+          "",
+          `${color.prompt("›")} Terminal: ${color.command(`codex resume --remote ${details.sharedAppServerRemoteAddress}`)}`,
+          `  ${color.muted("Connect through the shared Codex app-server to follow and steer the same live sessions.")}`,
+        ]
+      : []),
     "",
     `${color.prompt("›")} Commands`,
     `  ${color.command(npxCommand)}              Start and print a pairing QR`,
     `  ${color.command(`${npxCommand} --bg`)}         Start in the background`,
+    `  ${color.command(`${npxCommand} stop`)}         Stop the background relay`,
     `  ${color.command(`${npxCommand} qr`)}           Print this QR again`,
     `  ${color.command(`${npxCommand} approve <code>`)} Approve a device`,
     "",
@@ -186,9 +253,11 @@ function formatStartupInstructions(details: {
       : `${color.prompt("›")} Waiting for pairing requests`,
     details.dangerouslyAutoApprove
       ? `${color.prompt("›")} Disable this for normal use.`
-      : `${color.prompt("›")} Approve a device with ${color.command(
-          formatApprovalCommand("<code>", details.port),
-        )}`,
+      : process.stdin.isTTY && process.stdout.isTTY
+        ? `${color.prompt("›")} Approve a device here when prompted: type y and press Enter.`
+        : `${color.prompt("›")} Approve a device with ${color.command(
+            formatApprovalCommand("<code>", details.port),
+          )}`,
   ];
   return ["", ...lines, ""].join("\n");
 }

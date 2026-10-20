@@ -2,12 +2,14 @@ import { useSelector } from "@legendapp/state/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
   AgentSkill,
+  ChatMessage,
   PromptAttachment as ApiPromptAttachment,
   PromptSkill as ApiPromptSkill,
   PendingInputRequest,
   ReasoningEffort,
   RuntimeMode,
   RuntimePreferences,
+  StreamThreadRunEvent,
   ThreadCollaborationMode,
   ThreadSummary,
   WebPreviewTarget,
@@ -30,17 +32,31 @@ import {
 import * as ImagePicker from "expo-image-picker";
 import { useFocusEffect, useNavigation } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, AppState, Keyboard, Linking, Modal, Pressable, View } from "react-native";
+import {
+  ActivityIndicator,
+  Alert,
+  AppState,
+  Keyboard,
+  Linking,
+  Modal,
+  Pressable,
+  type LayoutChangeEvent,
+  useWindowDimensions,
+  View,
+} from "react-native";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { KeyboardController } from "react-native-keyboard-controller";
-import PagerView from "react-native-pager-view";
 import Animated, { LinearTransition } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StyleSheet } from "react-native-unistyles";
 
 import { ThemedText } from "@/components/themed-text";
+import { AdaptivePanes } from "@/components/ui/adaptive-panes";
+import { CopyableCommand } from "@/components/ui/copyable-command";
 import { AppToast } from "@/components/ui/toast";
 import { Colors, Fonts, Spacing } from "@/constants/theme";
 import { activeThreadAfterRefresh } from "@/lib/active-thread-selection";
+import { consumeHydratedDefaultThread } from "@/lib/server-state-hydration";
 import {
   getCodexRelayServerUrl,
   hasCodexRelaySession,
@@ -65,6 +81,7 @@ import { runtimePreferencesForWorkspace } from "@/lib/runtime-preferences";
 import {
   applyStreamEventToServerState,
   checkoutWorkspaceBranchServerState,
+  clearThreadGoalServerState,
   clearServerState,
   commitPushWorkspaceServerState,
   createThreadServerState,
@@ -73,29 +90,35 @@ import {
   fetchQueuedInputsState,
   fetchRateLimitsState,
   fetchStatusState,
+  fetchThreadGoalState,
+  fetchThreadQueryState,
   fetchThreadState,
   fetchThreadsState,
   fetchWorkspaceChangesState,
   optimisticallySteerQueuedInputState,
   removePendingInputRequestState,
   removeQueuedThreadInputServerState,
+  rewindThreadServerState,
   restoreOptimisticSteerQueuedInputState,
   serverStateKeys,
   serverStateQueryFns,
   setQueuedInputsState,
   setRuntimePreferencesResponseState,
-  setRuntimePreferencesState,
   setStatusState,
   setThreadDetailState,
   setThreadRunningState,
   setThreadsState,
-  setWorkspaceRuntimePreferencesState,
   steerQueuedThreadInputServerState,
   submitThreadInputServerState,
+  updateThreadGoalServerState,
   updateRuntimePreferencesServerState,
 } from "@/lib/server-state";
 import { recordSuccessfulAiConversationForReviewPrompt } from "@/lib/store-review-prompt";
-import { completeThreadRunSession, handleThreadRunStreamEvent } from "@/lib/thread-run-stream";
+import {
+  completeThreadRunSession,
+  handleThreadRunStreamEvent,
+  reconcileThreadRunEventAfterTerminal,
+} from "@/lib/thread-run-stream";
 import { readCachedWorkspaceRuntimePreferences } from "@/lib/workspace-runtime-preferences-cache";
 import {
   appendComposerAttachments,
@@ -125,8 +148,21 @@ import {
 import { addWorkspacePreviewTab } from "@/state/workspace-preview-store";
 
 import { ChatControls } from "./ChatControls";
+import { runConnectionRefresh } from "./connection-refresh";
+import {
+  modelForSelection,
+  normalizeRuntimePreferencesForModels,
+  reasoningEffortForModel as resolveReasoningEffortForModel,
+} from "./model-picker-options";
+import {
+  createRuntimePreferencesCoordinator,
+  type RuntimePreferencesStage,
+} from "./runtime-preferences-coordinator";
 import { ChatShell } from "./ChatShell";
+import type { ChatShellAction } from "./ChatShellHeader";
 import { ConnectionBanner } from "./ConnectionBanner";
+import { approvalCommand } from "./pairing-commands";
+import { EXPANDED_DRAWER_BREAKPOINT, useIpadSplitLayout } from "./ipad-split-layout";
 import { WorkspacePreviewSurface } from "./WorkspacePreviewSurface";
 import type { WorkspaceMarkdownPreviewTarget } from "./workspace-preview/markdown-target";
 
@@ -139,12 +175,23 @@ const STREAM_STALL_RECONNECT_MS = 45_000;
 const STREAM_WATCHDOG_INTERVAL_MS = 10_000;
 const SCANNER_TO_APPROVAL_SHEET_DELAY_MS = 450;
 const COPY_TOAST_VISIBLE_MS = 1800;
+const PREVIEW_RESIZE_HANDLE_WIDTH = 14;
+const DEFAULT_PREVIEW_PANE_WIDTH = 540;
+const MIN_CHAT_PANE_WIDTH = 420;
+const MIN_PREVIEW_PANE_WIDTH = 360;
 const EMPTY_SKILLS: AgentSkill[] = [];
 const EMPTY_THREADS: ThreadSummary[] = [];
-let isHandlingPairingLink = false;
-let lastHandledPairingUrl: string | undefined;
 
-export function ChatScreen() {
+type ChatScreenProps = {
+  initialPairingUrl?: string | null;
+  onPairingComplete?: () => void;
+};
+
+export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenProps = {}) {
+  const isHandlingPairingLink = useRef(false);
+  const lastHandledPairingUrl = useRef<string | undefined>(undefined);
+  const { width } = useWindowDimensions();
+  const { isSidebarVisible, toggleSidebar } = useIpadSplitLayout();
   const [pasteApprovalCode, setPasteApprovalCode] = useState<string | undefined>(undefined);
   const [pasteApprovalServerUrl, setPasteApprovalServerUrl] = useState<string | undefined>(
     undefined,
@@ -171,14 +218,25 @@ export function ChatScreen() {
   >(undefined);
   const [isHandlingScan, setHandlingScan] = useState(false);
   const [activePagerPage, setActivePagerPage] = useState(0);
+  const [isWidePreviewVisible, setWidePreviewVisible] = useState(true);
+  const [wideLayoutWidth, setWideLayoutWidth] = useState(0);
+  const [previewPaneWidth, setPreviewPaneWidth] = useState(DEFAULT_PREVIEW_PANE_WIDTH);
   const [scannerMessage, setScannerMessage] = useState("Point the camera at the connection QR.");
   const copyToastIdRef = useRef(0);
+  const runtimePreferencesCoordinator = useMemo(createRuntimePreferencesCoordinator, []);
   const [copyToast, setCopyToast] = useState<{ id: number } | undefined>(undefined);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const usesExpandedSidebar = width >= EXPANDED_DRAWER_BREAKPOINT;
+  const usesWideLayout =
+    wideLayoutWidth >= MIN_CHAT_PANE_WIDTH + MIN_PREVIEW_PANE_WIDTH + PREVIEW_RESIZE_HANDLE_WIDTH;
   const drawerNavigation = useNavigation<{
     openDrawer?: () => void;
   }>();
   const queryClient = useQueryClient();
+  const fetchCurrentStatus = useCallback(async () => {
+    await runtimePreferencesCoordinator.afterUpdates();
+    return fetchStatusState(queryClient);
+  }, [queryClient, runtimePreferencesCoordinator]);
   const checkoutWorkspaceBranchMutation = useMutation({
     mutationFn: (body: Parameters<typeof checkoutWorkspaceBranchServerState>[1]) =>
       checkoutWorkspaceBranchServerState(queryClient, body),
@@ -209,6 +267,10 @@ export function ChatScreen() {
         .invalidateQueries({ queryKey: serverStateKeys.threads() })
         .catch(() => undefined);
     },
+  });
+  const rewindThreadMutation = useMutation({
+    mutationFn: ({ threadId, turnId }: { threadId: string; turnId: string }) =>
+      rewindThreadServerState(queryClient, threadId, { turnId }),
   });
   const removeQueuedThreadInputMutation = useMutation({
     mutationFn: (input: { inputId: string; threadId: string }) =>
@@ -257,6 +319,27 @@ export function ChatScreen() {
         .catch(() => undefined);
     },
   });
+  const updateThreadGoalMutation = useMutation({
+    mutationFn: (input: { objective?: string; status?: "active" | "paused"; threadId: string }) =>
+      updateThreadGoalServerState(queryClient, input.threadId, {
+        objective: input.objective,
+        status: input.status,
+      }),
+    onSuccess: (_response, input) => {
+      void queryClient
+        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId) })
+        .catch(() => undefined);
+    },
+  });
+  const clearThreadGoalMutation = useMutation({
+    mutationFn: (input: { threadId: string }) =>
+      clearThreadGoalServerState(queryClient, input.threadId),
+    onSuccess: (_response, input) => {
+      void queryClient
+        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId) })
+        .catch(() => undefined);
+    },
+  });
   const submitThreadInputMutation = useMutation({
     mutationFn: (input: {
       body: Parameters<typeof submitThreadInputServerState>[2];
@@ -268,33 +351,55 @@ export function ChatScreen() {
     },
   });
   const updateRuntimePreferencesMutation = useMutation({
-    mutationFn: (body: Parameters<typeof updateRuntimePreferencesServerState>[0]) =>
-      updateRuntimePreferencesServerState(body),
-    onSuccess(response) {
-      setRuntimePreferencesResponseState(queryClient, response);
-      const workspacePreferences = response.workspacePath
-        ? (response.runtimePreferencesByWorkspacePath[response.workspacePath] ??
-          response.preferences)
-        : undefined;
-      if (response.workspacePath && workspacePreferences) {
-        setOptimisticRuntimePreferencesByWorkspacePath((current) => ({
-          ...current,
-          [response.workspacePath as string]: workspacePreferences,
-        }));
-      } else {
-        setOptimisticRuntimePreferences(response.preferences);
-      }
-      queryClient.setQueryData(serverStateKeys.status(), (current) => current);
+    mutationFn(input: {
+      body: Parameters<typeof updateRuntimePreferencesServerState>[0];
+      stage: RuntimePreferencesStage;
+    }) {
+      return runtimePreferencesCoordinator.enqueue(async () => {
+        await queryClient.cancelQueries({ queryKey: serverStateKeys.status() });
+        return updateRuntimePreferencesServerState(input.body);
+      });
     },
-    onError(caught) {
-      syncPairedSessionState();
+    onSuccess(response, input) {
+      setRuntimePreferencesResponseState(queryClient, response);
+      if (!runtimePreferencesCoordinator.settle(input.stage)) {
+        return;
+      }
+      const targetWorkspacePath = input.body.workspacePath;
+      if (targetWorkspacePath) {
+        setOptimisticRuntimePreferencesByWorkspacePath((current) => {
+          const next = { ...current };
+          delete next[targetWorkspacePath];
+          return next;
+        });
+      } else {
+        setOptimisticRuntimePreferences(undefined);
+      }
+    },
+    onError(caught, input) {
+      if (!runtimePreferencesCoordinator.settle(input.stage)) {
+        return;
+      }
+      const targetWorkspacePath = input.body.workspacePath;
+      if (targetWorkspacePath) {
+        setOptimisticRuntimePreferencesByWorkspacePath((current) => {
+          const next = { ...current };
+          delete next[targetWorkspacePath];
+          return next;
+        });
+      } else {
+        setOptimisticRuntimePreferences(undefined);
+      }
+      if (syncPairedSessionState()) {
+        void fetchCurrentStatus().catch(() => undefined);
+      }
       setConnection("offline", errorMessage(caught));
     },
   });
-  const pagerRef = useRef<PagerView>(null);
   const isAttachingImagesRef = useRef(false);
   const isHandlingScanRef = useRef(false);
   const isModernScannerOpenRef = useRef(false);
+  const previewResizeStartWidthRef = useRef(DEFAULT_PREVIEW_PANE_WIDTH);
   const scanPairingGenerationRef = useRef(0);
   const closeStreamRef = useRef<(() => void) | undefined>(undefined);
   const refreshPromiseRef = useRef<Promise<void> | undefined>(undefined);
@@ -345,7 +450,7 @@ export function ChatScreen() {
     queryKey: activeThreadId
       ? serverStateKeys.thread(activeThreadId)
       : [...serverStateKeys.threads(), "__inactive__", "detail"],
-    queryFn: ({ queryKey }) => serverStateQueryFns.thread(String(queryKey[3] ?? "")),
+    queryFn: ({ queryKey }) => fetchThreadQueryState(queryClient, String(queryKey[3] ?? "")),
     enabled: Boolean(activeThreadId),
   });
   const queuedInputsQuery = useQuery({
@@ -377,6 +482,10 @@ export function ChatScreen() {
   const activeThread =
     activeThreadDetailQuery.data?.thread ??
     (activeThreadId ? threadsById[activeThreadId] : undefined);
+  const canMutateActiveThread =
+    statusQuery.data?.appServerAvailable === true &&
+    threadsQuery.data?.source === "app-server" &&
+    Boolean(activeThreadId && threadsById[activeThreadId]);
   const isRunningAppThread = activeThread?.source === "app" && activeThread.state === "running";
   const activeWorkspacePath = activeThread?.cwd ?? workspacePath;
   const skillsQuery = useQuery({
@@ -508,24 +617,21 @@ export function ChatScreen() {
   }, []);
 
   const syncThreadSnapshot = useCallback(
-    async (threadId: string, options: { setOfflineOnError?: boolean } = {}) => {
+    async (threadId: string, options: { refresh?: boolean; setOfflineOnError?: boolean } = {}) => {
       const setOfflineOnError = options.setOfflineOnError ?? true;
       setThreadMessagesLoading(threadId, true);
       try {
-        const response = await fetchThreadState(queryClient, threadId);
+        const response = await fetchThreadState(queryClient, threadId, {
+          refresh: options.refresh,
+        });
         syncPairedSessionState();
         if (chatStore$.activeThreadId.peek() !== threadId) {
           return response.thread.state;
         }
-        setThreadDetailState(
-          queryClient,
-          response.thread,
-          response.messages,
-          response.pendingInputRequests,
-        );
         await Promise.all([
           fetchQueuedInputsState(queryClient, threadId).catch(() => undefined),
           fetchContextWindowState(queryClient, threadId).catch(() => undefined),
+          fetchThreadGoalState(queryClient, threadId).catch(() => undefined),
         ]);
         setConnection("connected");
         return response.thread.state;
@@ -561,9 +667,9 @@ export function ChatScreen() {
   );
 
   const loadThread = useCallback(
-    async (threadId: string) => {
+    async (threadId: string, options: { refresh?: boolean } = {}) => {
       setActiveThread(threadId);
-      const state = await syncThreadSnapshot(threadId);
+      const state = await syncThreadSnapshot(threadId, { refresh: options.refresh });
       if (state === "running") {
         requestThreadStreamReconnect(threadId);
         return;
@@ -606,27 +712,34 @@ export function ChatScreen() {
       try {
         await refreshSession().catch(() => false);
         syncPairedSessionState();
-        const [status, response, modelsResponse, rateLimitsResponse] = await Promise.all([
-          fetchStatusState(queryClient),
-          fetchThreadsState(queryClient),
-          fetchModelsState(queryClient),
-          fetchRateLimitsState(queryClient).catch(() => undefined),
-        ]);
-        applyStatusFromServer(status);
+        const [response, modelsResponse, rateLimitsResponse] = await runConnectionRefresh(
+          fetchCurrentStatus(),
+          Promise.all([
+            fetchThreadsState(queryClient),
+            fetchModelsState(queryClient),
+            fetchRateLimitsState(queryClient).catch(() => undefined),
+          ]),
+          (status) => {
+            applyStatusFromServer(status);
+            setConnection("connected");
+          },
+        );
         setThreadsState(queryClient, response.threads, response.source);
         queryClient.setQueryData(serverStateKeys.models(), modelsResponse);
         if (rateLimitsResponse) {
           queryClient.setQueryData(serverStateKeys.rateLimits(), rateLimitsResponse);
         }
-        setConnection("connected");
-
         const currentActiveThreadId = chatStore$.activeThreadId.peek();
+        const preferFirstThread = consumeHydratedDefaultThread(currentActiveThreadId);
         const hasCurrentActiveThread =
           !!currentActiveThreadId &&
           response.threads.some((thread) => thread.id === currentActiveThreadId);
         const missingActiveThreadState =
           currentActiveThreadId && !hasCurrentActiveThread
-            ? await syncThreadSnapshot(currentActiveThreadId, { setOfflineOnError: false })
+            ? await syncThreadSnapshot(currentActiveThreadId, {
+                refresh: true,
+                setOfflineOnError: false,
+              })
             : undefined;
         if (chatStore$.activeThreadId.peek() !== currentActiveThreadId) {
           return;
@@ -635,6 +748,7 @@ export function ChatScreen() {
         const nextActiveThreadId = activeThreadAfterRefresh({
           currentActiveThreadId,
           missingActiveThreadRestored,
+          preferFirstThread,
           threads: response.threads,
         });
 
@@ -642,7 +756,7 @@ export function ChatScreen() {
           setActiveThread(nextActiveThreadId);
         }
         if (nextActiveThreadId && !missingActiveThreadRestored) {
-          await loadThread(nextActiveThreadId);
+          await loadThread(nextActiveThreadId, { refresh: true });
         } else if (nextActiveThreadId && missingActiveThreadState === "running") {
           requestThreadStreamReconnect(nextActiveThreadId);
         }
@@ -658,14 +772,21 @@ export function ChatScreen() {
       }
     });
     return request;
-  }, [applyStatusFromServer, loadThread, queryClient, syncPairedSessionState, syncThreadSnapshot]);
+  }, [
+    applyStatusFromServer,
+    fetchCurrentStatus,
+    loadThread,
+    queryClient,
+    syncPairedSessionState,
+    syncThreadSnapshot,
+  ]);
 
   const keepConnectionIfSessionIsValid = useCallback(
     async (fallbackError: string) => {
       try {
         await refreshSession().catch(() => false);
         syncPairedSessionState();
-        const status = await fetchStatusState(queryClient);
+        const status = await fetchCurrentStatus();
         applyStatusFromServer(status);
         setConnection("connected");
       } catch (caught) {
@@ -673,7 +794,7 @@ export function ChatScreen() {
         setConnection("offline", caught instanceof Error ? caught.message : fallbackError);
       }
     },
-    [applyStatusFromServer, queryClient, syncPairedSessionState],
+    [applyStatusFromServer, fetchCurrentStatus, syncPairedSessionState],
   );
 
   const recoverThreadAfterStreamLoss = useCallback(
@@ -740,6 +861,7 @@ export function ChatScreen() {
       streamGenerationRef.current = streamGeneration;
       let receivedStreamEvent = false;
       let sawTerminalStreamEvent = false;
+      let terminalStreamEvent: StreamThreadRunEvent | undefined;
       markStreamActivity();
       setThreadRunningState(queryClient, threadId, true);
       setConnection("connected");
@@ -753,9 +875,16 @@ export function ChatScreen() {
             if (streamGeneration !== streamGenerationRef.current) {
               return;
             }
+            const reconciledEvent = reconcileThreadRunEventAfterTerminal(
+              event,
+              terminalStreamEvent,
+            );
+            if (!reconciledEvent) {
+              return;
+            }
             markStreamActivity();
             receivedStreamEvent = true;
-            handleThreadRunStreamEvent(event, {
+            handleThreadRunStreamEvent(reconciledEvent, {
               fallbackThreadId: threadId,
               applyEvent: (streamEvent) => {
                 applyStreamEventToServerState(queryClient, streamEvent);
@@ -767,7 +896,11 @@ export function ChatScreen() {
                 }));
               },
               onTerminal(terminalThreadId, terminalEvent) {
+                if (sawTerminalStreamEvent) {
+                  return;
+                }
                 sawTerminalStreamEvent = true;
+                terminalStreamEvent = terminalEvent;
                 completeThreadRunSession({
                   threadId: terminalThreadId,
                   clearQueuedPrompts,
@@ -876,9 +1009,6 @@ export function ChatScreen() {
 
   const showPagerPage = useCallback((page: number) => {
     setActivePagerPage(page);
-    requestAnimationFrame(() => {
-      pagerRef.current?.setPage(page);
-    });
   }, []);
 
   const guardWorkspacePreviewAction = useCallback(async () => true, []);
@@ -925,11 +1055,16 @@ export function ChatScreen() {
       dismissKeyboardForWorkspacePreview();
       addWorkspacePreviewTab(workspacePath, previewRequest.tab);
       hapticMediumImpact();
-      requestAnimationFrame(() => {
-        showPagerPage(1);
-      });
+      if (usesWideLayout) {
+        setWidePreviewVisible(true);
+        setActivePagerPage(1);
+      } else {
+        requestAnimationFrame(() => {
+          showPagerPage(1);
+        });
+      }
     },
-    [activeThreadId, activeWorkspacePath, showPagerPage],
+    [activeThreadId, activeWorkspacePath, showPagerPage, usesWideLayout],
   );
 
   const openMarkdownAttachmentPreview = useCallback(
@@ -946,8 +1081,13 @@ export function ChatScreen() {
 
   const closeWorkspacePreview = useCallback(() => {
     hapticSelection();
+    if (usesWideLayout) {
+      setWidePreviewVisible(false);
+      setActivePagerPage(0);
+      return;
+    }
     showPagerPage(0);
-  }, [showPagerPage]);
+  }, [showPagerPage, usesWideLayout]);
 
   const checkoutBranch = useCallback(
     async (branch: string) => {
@@ -1088,7 +1228,8 @@ export function ChatScreen() {
     if (!cameraPermission?.granted) {
       const permission = await requestCameraPermission();
       if (!permission.granted) {
-        Alert.alert("Camera access needed", "Allow camera access to scan the connection QR code.");
+        setScannerMessage("Camera access is off. Allow camera access to scan the connection QR.");
+        setScannerOpen(true);
         return;
       }
     }
@@ -1116,20 +1257,29 @@ export function ChatScreen() {
     setScannerOpen(true);
   }
 
+  async function retryCameraPermission() {
+    const permission = await requestCameraPermission();
+    setScannerMessage(
+      permission.granted
+        ? "Point the camera at the connection QR."
+        : "Camera access is off. Allow camera access to scan the connection QR.",
+    );
+  }
+
   const handlePairingLink = useCallback(
     async (url: string | null) => {
       const pairingUrl = url?.trim();
       if (
         !pairingUrl?.startsWith("codex-relay://pair") ||
-        pairingUrl === lastHandledPairingUrl ||
-        isHandlingPairingLink
+        (pairingUrl === lastHandledPairingUrl.current && hasCodexRelaySession()) ||
+        isHandlingPairingLink.current
       ) {
         return;
       }
 
-      lastHandledPairingUrl = pairingUrl;
-      isHandlingPairingLink = true;
+      isHandlingPairingLink.current = true;
       setPastePairing(true);
+      setPastePairOpen(true);
       setPasteApprovalCode(undefined);
       setPasteApprovalServerUrl(undefined);
       try {
@@ -1144,34 +1294,33 @@ export function ChatScreen() {
         clearServerState(queryClient);
         syncPairedSessionState();
         setPastePairOpen(false);
+        lastHandledPairingUrl.current = pairingUrl;
         setPasteApprovalCode(undefined);
         setPasteApprovalServerUrl(undefined);
         hapticSuccess();
         await refresh();
-      } catch {
-        Alert.alert("Pairing failed", pairingFailureAlertMessage);
+        onPairingComplete?.();
+      } catch (caught) {
+        setPastePairOpen(false);
+        Alert.alert(
+          "Pairing failed",
+          caught instanceof Error ? caught.message : pairingFailureAlertMessage,
+        );
       } finally {
-        isHandlingPairingLink = false;
+        isHandlingPairingLink.current = false;
         setPastePairing(false);
       }
     },
-    [queryClient, refresh, syncPairedSessionState],
+    [onPairingComplete, queryClient, refresh, syncPairedSessionState],
   );
 
   useEffect(() => {
-    let isMounted = true;
-    void Linking.getInitialURL().then((url) => {
-      if (isMounted) {
-        void handlePairingLink(url);
-      }
-    });
-    const unsubscribe = subscribeToPairingLinks(handlePairingLink);
-
-    return () => {
-      isMounted = false;
-      unsubscribe();
-    };
-  }, [handlePairingLink]);
+    // Expo Router delivers deep links to /pair. The background chat screen must
+    // not race that route for an approval code that only its hidden UI can show.
+    if (initialPairingUrl) {
+      void handlePairingLink(initialPairingUrl);
+    }
+  }, [handlePairingLink, initialPairingUrl]);
 
   const closeScannerSurface = useCallback(async () => {
     const wasModernScannerOpen = isModernScannerOpenRef.current;
@@ -1414,6 +1563,7 @@ export function ChatScreen() {
       streamGenerationRef.current = streamGeneration;
       let receivedStreamEvent = false;
       let sawTerminalStreamEvent = false;
+      let terminalStreamEvent: StreamThreadRunEvent | undefined;
       markStreamActivity();
       const restorePrompt = () => {
         if (!input.restoreDraftOnFailure) {
@@ -1440,12 +1590,22 @@ export function ChatScreen() {
             if (streamGeneration !== streamGenerationRef.current) {
               return;
             }
+            const reconciledEvent = reconcileThreadRunEventAfterTerminal(
+              event,
+              terminalStreamEvent,
+            );
+            if (!reconciledEvent) {
+              return;
+            }
             markStreamActivity();
             receivedStreamEvent = true;
-            if (event.type === "thread.state.changed" && event.thread.state === "running") {
-              markQueuedPromptStarted(runThreadId, event.thread.lastPrompt);
+            if (
+              reconciledEvent.type === "thread.state.changed" &&
+              reconciledEvent.thread.state === "running"
+            ) {
+              markQueuedPromptStarted(runThreadId, reconciledEvent.thread.lastPrompt);
             }
-            handleThreadRunStreamEvent(event, {
+            handleThreadRunStreamEvent(reconciledEvent, {
               fallbackThreadId: runThreadId,
               applyEvent: (streamEvent) => {
                 applyStreamEventToServerState(queryClient, streamEvent);
@@ -1457,7 +1617,11 @@ export function ChatScreen() {
                 }));
               },
               onTerminal(terminalThreadId, terminalEvent) {
+                if (sawTerminalStreamEvent) {
+                  return;
+                }
                 sawTerminalStreamEvent = true;
+                terminalStreamEvent = terminalEvent;
                 completeThreadRunSession({
                   threadId: terminalThreadId,
                   clearQueuedPrompts,
@@ -1762,34 +1926,88 @@ export function ChatScreen() {
     hapticWarning();
   }
 
-  async function createNewThread() {
-    if (isRunning) {
+  function confirmRewind(message: ChatMessage) {
+    if (
+      !canMutateActiveThread ||
+      !activeThreadId ||
+      !message.turnId ||
+      isRunning ||
+      rewindThreadMutation.isPending
+    ) {
       return;
     }
 
-    const newThreadCollaborationMode = collaborationMode;
+    Alert.alert("Rewind chat?", "This removes this prompt and everything after it from the chat.", [
+      { style: "cancel", text: "Cancel" },
+      {
+        style: "destructive",
+        text: "Rewind",
+        onPress: () => void rewindFromMessage(message),
+      },
+    ]);
+  }
+
+  async function rewindFromMessage(message: ChatMessage) {
+    if (
+      !canMutateActiveThread ||
+      !activeThreadId ||
+      !message.turnId ||
+      rewindThreadMutation.isPending
+    ) {
+      return;
+    }
+
+    clearThreadStatusPoll();
+    detachCurrentStream();
     try {
-      const response = await createThreadMutation.mutateAsync({
-        title: "New chat",
-        collaborationMode: newThreadCollaborationMode,
-        workspacePath: activeWorkspacePath,
+      await rewindThreadMutation.mutateAsync({
+        threadId: activeThreadId,
+        turnId: message.turnId,
       });
-      setThreadCollaborationMode(response.thread.id, newThreadCollaborationMode);
-      setThreadDetailState(queryClient, response.thread, response.messages);
-      setActiveThread(response.thread.id);
-      clearQueuedPrompts();
-      setQueuedInputsState(queryClient, response.thread.id, []);
+      clearQueuedPrompts(activeThreadId);
       setConnection("connected");
       hapticSuccess();
+      await refreshUsageStatus(activeThreadId);
     } catch (caught) {
       syncPairedSessionState();
-      setConnection("offline", errorMessage(caught));
+      Alert.alert("Couldn’t rewind chat", errorMessage(caught));
     }
+  }
+
+  function saveThreadGoalObjective(objective: string) {
+    if (!activeThreadId) {
+      return;
+    }
+    updateThreadGoalMutation.mutate({ threadId: activeThreadId, objective });
+    hapticSelection();
+  }
+
+  function toggleThreadGoalPause() {
+    if (!activeThreadId || !activeThread?.goal) {
+      return;
+    }
+    updateThreadGoalMutation.mutate({
+      threadId: activeThreadId,
+      status: activeThread.goal.status === "paused" ? "active" : "paused",
+    });
+    hapticMediumImpact();
+  }
+
+  function clearThreadGoal() {
+    if (!activeThreadId) {
+      return;
+    }
+    clearThreadGoalMutation.mutate({ threadId: activeThreadId });
+    hapticWarning();
   }
 
   function currentRuntimePreferences(): RuntimePreferences {
     const thread = activeThread;
     const targetWorkspacePath = thread?.cwd ?? workspacePath;
+    const stagedPreferences = runtimePreferencesCoordinator.current(targetWorkspacePath ?? "");
+    if (stagedPreferences) {
+      return runtimePreferencesWithAvailableServiceTier(stagedPreferences);
+    }
     const cachedStatus =
       queryClient.getQueryData<Awaited<ReturnType<typeof serverStateQueryFns.status>>>(
         serverStateKeys.status(),
@@ -1813,18 +2031,10 @@ export function ChatScreen() {
     modelId: string | undefined,
     preferredReasoningEffort: ReasoningEffort | undefined,
   ) {
-    const model = models.find((candidate) => candidate.model === modelId);
-    const supported = model?.supportedReasoningEfforts ?? [];
-    if (supported.length === 0) {
-      return undefined;
-    }
-    if (preferredReasoningEffort && supported.includes(preferredReasoningEffort)) {
-      return preferredReasoningEffort;
-    }
-    if (model?.defaultReasoningEffort && supported.includes(model.defaultReasoningEffort)) {
-      return model.defaultReasoningEffort;
-    }
-    return supported.includes("medium") ? "medium" : supported[0];
+    return resolveReasoningEffortForModel(
+      models.find((candidate) => candidate.model === modelId),
+      preferredReasoningEffort,
+    );
   }
 
   function serviceTierForModel(
@@ -1839,14 +2049,7 @@ export function ChatScreen() {
   }
 
   function runtimePreferencesWithAvailableServiceTier(preferences: RuntimePreferences) {
-    const modelId = preferences.model ?? models[0]?.model;
-    if (!preferences.serviceTier || serviceTierForModel(modelId, preferences.serviceTier)) {
-      return preferences;
-    }
-    return {
-      ...preferences,
-      serviceTier: undefined,
-    };
+    return normalizeRuntimePreferencesForModels(models, preferences);
   }
 
   function commitRuntimePreferences(preferences: RuntimePreferences) {
@@ -1856,17 +2059,20 @@ export function ChatScreen() {
         ...current,
         [targetWorkspacePath]: preferences,
       }));
-      setWorkspaceRuntimePreferencesState(queryClient, targetWorkspacePath, preferences);
     } else {
       setOptimisticRuntimePreferences(preferences);
-      setRuntimePreferencesState(queryClient, preferences);
     }
+    const scopeKey = targetWorkspacePath ?? "";
+    const stage = runtimePreferencesCoordinator.stage(scopeKey, preferences);
     updateRuntimePreferencesMutation.mutate({
-      model: preferences.model ?? null,
-      serviceTier: preferences.serviceTier ?? null,
-      reasoningEffort: preferences.reasoningEffort ?? null,
-      runtimeMode: preferences.runtimeMode,
-      ...(targetWorkspacePath ? { workspacePath: targetWorkspacePath } : {}),
+      body: {
+        model: preferences.model ?? null,
+        serviceTier: preferences.serviceTier ?? null,
+        reasoningEffort: preferences.reasoningEffort ?? null,
+        runtimeMode: preferences.runtimeMode,
+        ...(targetWorkspacePath ? { workspacePath: targetWorkspacePath } : {}),
+      },
+      stage,
     });
   }
 
@@ -1878,26 +2084,36 @@ export function ChatScreen() {
     });
   }
 
-  function changeSelectedModel(model: string) {
+  function changeSelectedModel(model: string, reasoningEffort?: ReasoningEffort) {
     const currentPreferences = currentRuntimePreferences();
     const serviceTier = serviceTierForModel(model, currentPreferences.serviceTier);
     commitRuntimePreferences({
       ...currentPreferences,
       model,
       serviceTier,
-      reasoningEffort: reasoningEffortForModel(model, currentPreferences.reasoningEffort),
+      reasoningEffort: reasoningEffortForModel(
+        model,
+        reasoningEffort ?? currentPreferences.reasoningEffort,
+      ),
     });
   }
 
   function changeSelectedServiceTier(serviceTier: string | undefined) {
     const currentPreferences = currentRuntimePreferences();
-    const model = serviceTier
-      ? (currentPreferences.model ?? models[0]?.model)
-      : currentPreferences.model;
+    const selectedModel = currentPreferences.model;
+    const catalogModel = modelForSelection(models, selectedModel);
+    const model = serviceTier ? (selectedModel ?? catalogModel?.model) : selectedModel;
+    const hasUnknownSelectedModel = Boolean(selectedModel && !catalogModel);
+    const isCurrentCustomServiceTier = Boolean(
+      serviceTier && serviceTier === currentPreferences.serviceTier,
+    );
     commitRuntimePreferences({
       ...currentPreferences,
       ...(model ? { model } : {}),
-      serviceTier: serviceTierForModel(model, serviceTier),
+      serviceTier:
+        hasUnknownSelectedModel || isCurrentCustomServiceTier
+          ? serviceTier
+          : serviceTierForModel(model, serviceTier),
     });
   }
 
@@ -1931,128 +2147,215 @@ export function ChatScreen() {
     hapticMediumImpact();
   }
 
+  function toggleThreadSidebar() {
+    Keyboard.dismiss();
+    toggleSidebar();
+    hapticMediumImpact();
+  }
+
+  function toggleWorkspacePreview() {
+    Keyboard.dismiss();
+    const nextVisible = !isWidePreviewVisible;
+    setWidePreviewVisible(nextVisible);
+    setActivePagerPage(nextVisible ? 1 : 0);
+    hapticMediumImpact();
+  }
+
+  const onWideLayout = useCallback((event: LayoutChangeEvent) => {
+    const nextWidth = Math.round(event.nativeEvent.layout.width);
+    setWideLayoutWidth((current) => (current === nextWidth ? current : nextWidth));
+  }, []);
+
+  const clampedPreviewPaneWidth = clampPreviewPaneWidth(previewPaneWidth, wideLayoutWidth);
+  const showsWidePreviewPane = hasPairedSession && usesWideLayout && isWidePreviewVisible;
+
+  const beginPreviewResize = useCallback(() => {
+    previewResizeStartWidthRef.current = clampedPreviewPaneWidth;
+    hapticSelection();
+  }, [clampedPreviewPaneWidth]);
+
+  const resizePreview = useCallback(
+    (translationX: number) => {
+      setPreviewPaneWidth(
+        clampPreviewPaneWidth(previewResizeStartWidthRef.current - translationX, wideLayoutWidth),
+      );
+    },
+    [wideLayoutWidth],
+  );
+
+  const previewResizeGesture = useMemo(
+    () =>
+      Gesture.Pan()
+        .runOnJS(true)
+        .onBegin(beginPreviewResize)
+        .onUpdate((event) => resizePreview(event.translationX)),
+    [beginPreviewResize, resizePreview],
+  );
+
   const showMessageCopiedToast = useCallback(() => {
     copyToastIdRef.current += 1;
     setCopyToast({ id: copyToastIdRef.current });
   }, []);
 
   const isPairing = isPastePairing || isHandlingScan;
+  const isWorkspacePreviewVisible = usesWideLayout
+    ? showsWidePreviewPane
+    : hasPairedSession && activePagerPage === 1;
+  const chatTrailingActions: ChatShellAction[] = hasPairedSession
+    ? [
+        {
+          icon: "refresh",
+          label: "Refresh chat",
+          onPress: refresh,
+        },
+        {
+          icon: usesWideLayout ? (isWidePreviewVisible ? "previewHide" : "preview") : "preview",
+          label: usesWideLayout
+            ? isWidePreviewVisible
+              ? "Hide workspace preview"
+              : "Show workspace preview"
+            : "Workspace preview",
+          onPress: usesWideLayout
+            ? toggleWorkspacePreview
+            : () =>
+                openWorkspacePreview({
+                  protocol: WORKSPACE_PREVIEW_OPEN_PROTOCOL,
+                  tab: "git",
+                  workspacePath: activeWorkspacePath,
+                }),
+        },
+      ]
+    : [];
+  const chatPane = (
+    <ChatShell
+      horizontalSafeArea={false}
+      banner={
+        <Animated.View layout={chatBannerLayoutTransition} style={styles.bannerStack}>
+          <ConnectionBanner
+            connection={connection}
+            error={error}
+            hasPairedSession={hasPairedSession}
+            serverUrl={serverUrl}
+            workspacePath={workspacePath}
+            onRefresh={refresh}
+            onScanConnect={openScanner}
+          />
+        </Animated.View>
+      }
+      composerDisabled={connection === "offline"}
+      composerInputEditable={connection !== "offline" || hasPairedSession}
+      composerFocusRecoveryKey={connection}
+      collaborationMode={collaborationMode}
+      composerFocusRequestKey={composerFocusRequestKey}
+      composerFooter={
+        <ChatControls
+          models={models}
+          runtimeMode={runtimeMode}
+          selectedReasoningEffort={selectedReasoningEffort}
+          selectedServiceTier={selectedServiceTier}
+          selectedModel={selectedModel}
+          onRuntimeModeChange={changeRuntimeMode}
+          onSelectedReasoningEffortChange={changeSelectedReasoningEffort}
+          onSelectedServiceTierChange={changeSelectedServiceTier}
+          onSelectedModelChange={changeSelectedModel}
+        />
+      }
+      contextWindowUsage={contextWindowUsage}
+      goal={activeThread?.goal ?? null}
+      inputNativeID={CHAT_INPUT_NATIVE_ID}
+      isAttachingImage={isAttachingImages}
+      isLoadingMessages={isLoadingMessages}
+      isRunning={isRunning}
+      leadingAction={{
+        icon: usesExpandedSidebar ? (isSidebarVisible ? "sidebarHide" : "sidebarShow") : "menu",
+        label: usesExpandedSidebar
+          ? isSidebarVisible
+            ? "Hide threads"
+            : "Show threads"
+          : "Open threads",
+        onPress: usesExpandedSidebar ? toggleThreadSidebar : openThreadDrawer,
+      }}
+      messages={messages}
+      onAttachImage={attachImagesFromGallery}
+      onCancel={stopRun}
+      onCollaborationModeChange={changeCollaborationMode}
+      onAddPlanContext={addPlanContext}
+      onImplementPlan={implementPlan}
+      onIgnoreInputRequest={(request) => void ignoreInputRequest(request)}
+      onMessageCopied={showMessageCopiedToast}
+      onMessageRewind={
+        canMutateActiveThread && !isRunning && !rewindThreadMutation.isPending
+          ? confirmRewind
+          : undefined
+      }
+      onOpenMarkdownAttachment={openMarkdownAttachmentPreview}
+      onRefreshUsageStatus={() => refreshUsageStatus()}
+      onSubmitInputRequest={(request, answers) => void submitInputRequest(request, answers)}
+      onRemoveQueuedPrompt={(item) => void removeQueuedPrompt(item)}
+      onRestoreQueuedPrompt={(item) => void restoreQueuedPrompt(item)}
+      onSend={() => sendPrompt()}
+      onSteerQueuedPrompt={(item) => void steerQueuedPrompt(item)}
+      onClearGoal={clearThreadGoal}
+      onSaveGoal={saveThreadGoalObjective}
+      onToggleGoalPause={toggleThreadGoalPause}
+      pendingInputRequest={pendingInputRequest}
+      queuedPrompts={queuedPrompts}
+      rateLimitBuckets={rateLimitBuckets}
+      skills={skills}
+      skillsLoadState={skillsLoadState}
+      subtitle={activeWorkspacePath ?? "codex-relay"}
+      threadId={activeThreadId}
+      title={activeThread?.title ?? "Codex Relay"}
+      trailingActions={chatTrailingActions}
+      workspacePath={activeWorkspacePath}
+    />
+  );
+  const workspacePreviewPane = (
+    <WorkspacePreviewSurface
+      key={activeThreadId ?? "no-thread"}
+      isFocused={isWorkspacePreviewVisible}
+      isRunning={isRunning}
+      isLoadingChanges={isLoadingChanges}
+      serverUrl={serverUrl}
+      workspaceChanges={workspaceChanges}
+      workspaceChangesError={workspaceChangesError}
+      workspacePath={activeWorkspacePath}
+      markdownPreviewTarget={markdownPreviewTarget}
+      webPreviewTarget={activeWebPreviewTarget}
+      onClose={closeWorkspacePreview}
+      sideBySide={usesWideLayout}
+      showCloseButton
+      onCheckoutBranch={checkoutBranch}
+      onCommitPush={commitPush}
+      onCreatePullRequest={createPullRequest}
+      onRefreshChanges={loadWorkspaceChanges}
+    />
+  );
 
   return (
     <>
-      <PagerView
-        ref={pagerRef}
-        initialPage={0}
-        onPageSelected={(event) => setActivePagerPage(event.nativeEvent.position)}
-        style={styles.pager}
-      >
-        <View key="chat" collapsable={false} style={styles.pagerPage}>
-          <ChatShell
-            banner={
-              <Animated.View layout={chatBannerLayoutTransition} style={styles.bannerStack}>
-                <ConnectionBanner
-                  connection={connection}
-                  error={error}
-                  hasPairedSession={hasPairedSession}
-                  serverUrl={serverUrl}
-                  workspacePath={workspacePath}
-                  onRefresh={refresh}
-                  onScanConnect={openScanner}
-                />
-              </Animated.View>
-            }
-            composerDisabled={connection === "offline"}
-            composerInputEditable={connection !== "offline" || hasPairedSession}
-            composerFocusRecoveryKey={connection}
-            collaborationMode={collaborationMode}
-            composerFocusRequestKey={composerFocusRequestKey}
-            composerFooter={
-              <ChatControls
-                models={models}
-                runtimeMode={runtimeMode}
-                selectedReasoningEffort={selectedReasoningEffort}
-                selectedServiceTier={selectedServiceTier}
-                selectedModel={selectedModel}
-                onRuntimeModeChange={changeRuntimeMode}
-                onSelectedReasoningEffortChange={changeSelectedReasoningEffort}
-                onSelectedServiceTierChange={changeSelectedServiceTier}
-                onSelectedModelChange={changeSelectedModel}
-              />
-            }
-            contextWindowUsage={contextWindowUsage}
-            inputNativeID={CHAT_INPUT_NATIVE_ID}
-            isAttachingImage={isAttachingImages}
-            isLoadingMessages={isLoadingMessages}
-            isRunning={isRunning}
-            leadingAction={{
-              icon: "menu",
-              label: "Open threads",
-              onPress: openThreadDrawer,
-            }}
-            messages={messages}
-            onAttachImage={attachImagesFromGallery}
-            onCancel={stopRun}
-            onCollaborationModeChange={changeCollaborationMode}
-            onAddPlanContext={addPlanContext}
-            onImplementPlan={implementPlan}
-            onIgnoreInputRequest={(request) => void ignoreInputRequest(request)}
-            onMessageCopied={showMessageCopiedToast}
-            onOpenMarkdownAttachment={openMarkdownAttachmentPreview}
-            onRefreshUsageStatus={() => refreshUsageStatus()}
-            onSubmitInputRequest={(request, answers) => void submitInputRequest(request, answers)}
-            onRemoveQueuedPrompt={(item) => void removeQueuedPrompt(item)}
-            onRestoreQueuedPrompt={(item) => void restoreQueuedPrompt(item)}
-            onSend={() => sendPrompt()}
-            onSteerQueuedPrompt={(item) => void steerQueuedPrompt(item)}
-            pendingInputRequest={pendingInputRequest}
-            queuedPrompts={queuedPrompts}
-            rateLimitBuckets={rateLimitBuckets}
-            skills={skills}
-            skillsLoadState={skillsLoadState}
-            subtitle={activeWorkspacePath ?? "codex-relay"}
-            threadId={activeThreadId}
-            title={activeThread?.title ?? "Codex Relay"}
-            trailingActions={[
-              {
-                disabled: isRunning,
-                icon: "newThread",
-                label: "New thread",
-                onPress: createNewThread,
-              },
-              {
-                icon: "preview",
-                label: "Workspace preview",
-                onPress: () =>
-                  openWorkspacePreview({
-                    protocol: WORKSPACE_PREVIEW_OPEN_PROTOCOL,
-                    tab: "git",
-                    workspacePath: activeWorkspacePath,
-                  }),
-              },
-            ]}
-            workspacePath={activeWorkspacePath}
-          />
-        </View>
-        <View key="changes" collapsable={false} style={styles.pagerPage}>
-          <WorkspacePreviewSurface
-            key={activeThreadId ?? "no-thread"}
-            isFocused={activePagerPage === 1}
-            isRunning={isRunning}
-            isLoadingChanges={isLoadingChanges}
-            serverUrl={serverUrl}
-            workspaceChanges={workspaceChanges}
-            workspaceChangesError={workspaceChangesError}
-            workspacePath={activeWorkspacePath}
-            markdownPreviewTarget={markdownPreviewTarget}
-            webPreviewTarget={activeWebPreviewTarget}
-            onClose={closeWorkspacePreview}
-            onCheckoutBranch={checkoutBranch}
-            onCommitPush={commitPush}
-            onCreatePullRequest={createPullRequest}
-            onRefreshChanges={loadWorkspaceChanges}
-          />
-        </View>
-      </PagerView>
+      <AdaptivePanes
+        primary={chatPane}
+        secondary={hasPairedSession ? workspacePreviewPane : null}
+        divider={
+          <GestureDetector gesture={previewResizeGesture}>
+            <Animated.View
+              accessibilityLabel="Resize workspace preview"
+              style={styles.previewResizeHandle}
+            >
+              <View style={styles.previewResizeGrip} />
+            </Animated.View>
+          </GestureDetector>
+        }
+        width={wideLayoutWidth}
+        secondaryWidth={clampedPreviewPaneWidth}
+        dividerWidth={PREVIEW_RESIZE_HANDLE_WIDTH}
+        sideBySide={usesWideLayout}
+        secondaryVisible={hasPairedSession && (!usesWideLayout || isWidePreviewVisible)}
+        selectedPane={activePagerPage}
+        onSelectPane={setActivePagerPage}
+        onLayout={onWideLayout}
+      />
       {copyToast ? (
         <AppToast
           key={copyToast.id}
@@ -2087,21 +2390,28 @@ export function ChatScreen() {
               </Pressable>
             </View>
             <View style={styles.manualFields}>
+              {isPairing && !pasteApprovalCode ? (
+                <ActivityIndicator accessibilityLabel="Connecting to your computer" />
+              ) : null}
               <ThemedText type="small" themeColor="textSecondary">
                 {pasteApprovalCode
-                  ? "Finish pairing from the Terminal window where codex-relay is running."
-                  : "QR recognized. Connecting to the relay..."}
+                  ? "If the relay is running interactively, switch to that terminal, check that this code matches, then type y and press Enter at the approval prompt."
+                  : "Finding your computer on LAN or Tailscale..."}
               </ThemedText>
               {pasteApprovalCode ? (
                 <View style={styles.manualApproval}>
                   <ThemedText type="smallBold">Approval code</ThemedText>
-                  <ThemedText style={styles.manualApprovalCode}>{pasteApprovalCode}</ThemedText>
+                  <ThemedText selectable style={styles.manualApprovalCode}>
+                    {pasteApprovalCode}
+                  </ThemedText>
                   <ThemedText type="small" themeColor="textSecondary">
-                    Run this on your computer:
+                    Alternatively, copy this command and run it in a new terminal on your computer:
                   </ThemedText>
-                  <ThemedText style={styles.manualApprovalCommand}>
-                    {approvalCommand(pasteApprovalCode, pasteApprovalServerUrl)}
-                  </ThemedText>
+                  <CopyableCommand
+                    command={approvalCommand(pasteApprovalCode, pasteApprovalServerUrl)}
+                    copyAccessibilityLabel="Copy approval command"
+                    textStyle={styles.manualApprovalCommand}
+                  />
                 </View>
               ) : null}
             </View>
@@ -2120,13 +2430,56 @@ export function ChatScreen() {
         visible={isScannerOpen}
       >
         <View style={styles.scannerScreen}>
-          <CameraView
-            active={isScannerOpen}
-            barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
-            facing="back"
-            onBarcodeScanned={isHandlingScan ? undefined : handleBarcodeScanned}
-            style={styles.camera}
-          />
+          {cameraPermission?.granted ? (
+            <CameraView
+              active={isScannerOpen}
+              barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+              facing="back"
+              onBarcodeScanned={isHandlingScan ? undefined : handleBarcodeScanned}
+              style={styles.camera}
+            />
+          ) : (
+            <View style={styles.scannerPermissionPanel}>
+              <View
+                accessible
+                accessibilityLabel="Camera access is off. Allow camera access to scan the connection QR."
+                style={styles.scannerPermissionCard}
+              >
+                <ThemedText type="smallBold" style={styles.scannerPermissionTitle}>
+                  Camera access is off
+                </ThemedText>
+                <ThemedText
+                  type="small"
+                  themeColor="textSecondary"
+                  style={styles.scannerPermissionCopy}
+                >
+                  Allow camera access to scan the connection QR, or close this screen and pair
+                  another way.
+                </ThemedText>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    cameraPermission?.canAskAgain === false
+                      ? "Open app settings for camera access"
+                      : "Try camera permission again"
+                  }
+                  onPress={
+                    cameraPermission?.canAskAgain === false
+                      ? () => void Linking.openSettings()
+                      : () => void retryCameraPermission()
+                  }
+                  style={({ pressed }) => [
+                    styles.scannerPermissionAction,
+                    pressed && styles.pressed,
+                  ]}
+                >
+                  <ThemedText type="smallBold" style={styles.scannerPermissionActionText}>
+                    {cameraPermission?.canAskAgain === false ? "Open Settings" : "Try Again"}
+                  </ThemedText>
+                </Pressable>
+              </View>
+            </View>
+          )}
           <SafeAreaView edges={["top", "left", "right"]} style={styles.scannerOverlay}>
             <View style={styles.scannerHeader}>
               <ThemedText type="smallBold" style={styles.scannerTitle}>
@@ -2339,13 +2692,6 @@ function agentSkillsFromPromptSkills(skills: ApiPromptSkill[], availableSkills: 
   });
 }
 
-function subscribeToPairingLinks(onUrl: (url: string) => void) {
-  const urlListener = Linking.addEventListener("url", (event) => {
-    onUrl(event.url);
-  });
-  return () => urlListener.remove();
-}
-
 function mergeAgentSkills(currentSkills: AgentSkill[], nextSkills: AgentSkill[]) {
   const seen = new Set(currentSkills.map(agentSkillKey));
   const merged = [...currentSkills];
@@ -2445,27 +2791,8 @@ function delay(ms: number) {
   });
 }
 
-function approvalCommand(approvalCode: string, serverUrl?: string) {
-  const port = approvalPort(serverUrl);
-  return port && port !== "8787"
-    ? `PORT=${port} npx codex-relay@latest approve ${approvalCode}`
-    : `npx codex-relay@latest approve ${approvalCode}`;
-}
-
 function approvalMessage(approvalCode: string, serverUrl?: string) {
-  return `Run ${approvalCommand(approvalCode, serverUrl)} in the server terminal.`;
-}
-
-function approvalPort(serverUrl?: string) {
-  if (!serverUrl) {
-    return undefined;
-  }
-
-  try {
-    return new URL(serverUrl).port;
-  } catch {
-    return undefined;
-  }
+  return `Check code ${approvalCode} in the running relay terminal and type y then Enter when prompted. Alternatively, run ${approvalCommand(approvalCode, serverUrl)} in a new terminal on your computer.`;
 }
 
 function readScannedPayload(result: unknown) {
@@ -2490,17 +2817,39 @@ function isBarcodeScannerCancellation(error: unknown) {
   return error instanceof Error && error.message.toLowerCase().includes("cancel");
 }
 
+function clampPreviewPaneWidth(value: number, layoutWidth: number) {
+  if (layoutWidth <= 0) {
+    return value;
+  }
+
+  const availableWidth = Math.max(0, layoutWidth - PREVIEW_RESIZE_HANDLE_WIDTH);
+  const minPreviewWidth = Math.min(MIN_PREVIEW_PANE_WIDTH, availableWidth * 0.45);
+  const minChatWidth = Math.min(MIN_CHAT_PANE_WIDTH, availableWidth * 0.55);
+  const maxPreviewWidth = Math.max(minPreviewWidth, availableWidth - minChatWidth);
+  return Math.min(maxPreviewWidth, Math.max(minPreviewWidth, value));
+}
+
 const chatBannerLayoutTransition = LinearTransition.duration(180);
 
 const styles = StyleSheet.create({
   pressed: {
     opacity: 0.7,
   },
-  pager: {
-    flex: 1,
+  previewResizeGrip: {
+    backgroundColor: "rgba(255, 255, 255, 0.22)",
+    borderRadius: 1,
+    height: 44,
+    marginLeft: -1,
+    opacity: 0.72,
+    width: 2,
   },
-  pagerPage: {
+  previewResizeHandle: {
     flex: 1,
+    alignItems: "flex-start",
+    borderLeftColor: "rgba(255, 255, 255, 0.08)",
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    justifyContent: "center",
+    width: PREVIEW_RESIZE_HANDLE_WIDTH,
   },
   bannerStack: {
     flexShrink: 0,
@@ -2555,6 +2904,43 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.three,
     paddingVertical: Spacing.two,
     textAlign: "center",
+  },
+  scannerPermissionPanel: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: Spacing.four,
+  },
+  scannerPermissionCard: {
+    backgroundColor: Colors.dark.backgroundElement,
+    borderColor: "rgba(255, 255, 255, 0.14)",
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: Spacing.three,
+    maxWidth: 340,
+    padding: Spacing.four,
+    width: "100%",
+  },
+  scannerPermissionTitle: {
+    fontSize: 17,
+    lineHeight: 22,
+    textAlign: "center",
+  },
+  scannerPermissionCopy: {
+    textAlign: "center",
+  },
+  scannerPermissionAction: {
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.08)",
+    borderColor: "rgba(132, 145, 165, 0.24)",
+    borderRadius: 8,
+    borderWidth: 1,
+    minHeight: 40,
+    justifyContent: "center",
+    paddingHorizontal: Spacing.three,
+  },
+  scannerPermissionActionText: {
+    color: Colors.dark.text,
   },
   manualScreen: {
     backgroundColor: Colors.dark.background,

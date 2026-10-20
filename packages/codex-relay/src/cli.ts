@@ -10,6 +10,11 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import { apiPaths } from "./api-schema.js";
+import {
+  readRunningRelayPid,
+  stopRunningRelay,
+  type StopRunningRelayResult,
+} from "./background-process.js";
 import { createTursoPairingSessionStore } from "./pairing-store.js";
 import { getConnectUrlGuidance } from "./pairing-url-candidates.js";
 
@@ -37,6 +42,10 @@ const program = new Command()
   .option("--bg", "run the Codex Relay server in the background")
   .option("--debug", "write verbose relay diagnostics to debug.log")
   .option(
+    "--shared-app-server",
+    "require a shared Codex app-server so terminal and mobile can share live sessions",
+  )
+  .option(
     "--dangerously-auto-approve",
     "automatically approve mobile pairing requests without a local approval command",
   )
@@ -46,7 +55,9 @@ const program = new Command()
 
 Examples:
   ${npxCommand}              Start the relay and print a pairing QR
+  ${npxCommand} --shared-app-server Share live sessions with a connected terminal
   ${npxCommand} --bg         Start the relay in the background
+  ${npxCommand} stop         Stop the background relay
   ${npxCommand} qr           Print the current pairing QR
   ${npxCommand} clear        Sign out every paired mobile app
   ${npxCommand} approve CODE Approve a pending mobile pairing request`,
@@ -58,6 +69,9 @@ Examples:
     if (options.dangerouslyAutoApprove) {
       process.env.CODEX_RELAY_DANGEROUSLY_AUTO_APPROVE = "1";
     }
+    if (options.sharedAppServer) {
+      process.env.CODEX_RELAY_APP_SERVER_MODE = "socket";
+    }
 
     if (options.bg) {
       await startBackgroundServer();
@@ -65,6 +79,13 @@ Examples:
     }
 
     await import("./index.js").catch(handleServerStartError);
+  });
+
+program
+  .command("stop")
+  .description("Stop the background Codex Relay server.")
+  .action(async () => {
+    await stopBackgroundServer();
   });
 
 program
@@ -100,7 +121,7 @@ async function startBackgroundServer() {
   const pidPath = codexRelayDataPath("server.pid");
   await mkdir(dirname(logPath), { recursive: true });
 
-  const existingPid = await readRunningPid(pidPath);
+  const existingPid = await readRunningRelayPid(pidPath);
   if (existingPid) {
     console.log(`codex-relay is already running in the background (pid ${existingPid}).`);
     console.log(`Logs: ${logPath}`);
@@ -142,21 +163,7 @@ async function startBackgroundServer() {
     console.log(`Debug logs: ${debugLogPath}`);
   }
   console.log(`Print the pairing QR later with: ${npxCommand} qr`);
-}
-
-async function readRunningPid(pidPath: string) {
-  const value = await readFile(pidPath, "utf8").catch(() => undefined);
-  const pid = value ? Number(value.trim()) : NaN;
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return undefined;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return pid;
-  } catch {
-    return undefined;
-  }
+  console.log(`Stop the background relay with: ${npxCommand} stop`);
 }
 
 function backgroundArgs() {
@@ -170,7 +177,7 @@ async function waitForBackgroundPid(child: ReturnType<typeof spawn>, pidPath: st
   });
 
   for (let attempt = 0; attempt < 50; attempt += 1) {
-    const pid = await readRunningPid(pidPath);
+    const pid = await readRunningRelayPid(pidPath);
     if (pid) {
       return pid;
     }
@@ -181,6 +188,32 @@ async function waitForBackgroundPid(child: ReturnType<typeof spawn>, pidPath: st
   }
 
   return undefined;
+}
+
+async function stopBackgroundServer() {
+  const result = await stopRunningRelay(codexRelayDataPath("server.pid"));
+  printStopResult(result);
+}
+
+function printStopResult(result: StopRunningRelayResult) {
+  switch (result.kind) {
+    case "not-running":
+      console.log("No background Codex Relay server is running.");
+      return;
+    case "stopped":
+      console.log(`Stopped codex-relay background server (pid ${result.pid}).`);
+      return;
+    case "timed-out":
+      console.error(`Timed out stopping codex-relay background server (pid ${result.pid}).`);
+      process.exitCode = 1;
+      return;
+    default:
+      return assertNever(result);
+  }
+}
+
+function assertNever(value: never): never {
+  throw new TypeError(`Unexpected background stop result: ${JSON.stringify(value)}`);
 }
 
 async function approvePairing(rawCode: string | undefined) {
@@ -324,7 +357,7 @@ async function clearDebugLogs() {
 }
 
 async function hasRunningBackgroundServer() {
-  return Boolean(await readRunningPid(codexRelayDataPath("server.pid")));
+  return Boolean(await readRunningRelayPid(codexRelayDataPath("server.pid")));
 }
 
 async function pathExists(path: string) {
@@ -388,7 +421,7 @@ async function handleServerStartError(error: unknown) {
 
   const pidPath = codexRelayDataPath("server.pid");
   const logPath = codexRelayDataPath("server.log");
-  const existingPid = await readRunningPid(pidPath);
+  const existingPid = await readRunningRelayPid(pidPath);
   const storedState = await readServerState();
   const state = storedState?.pairingPayload ? storedState : await readServerLogState();
 
@@ -400,7 +433,7 @@ async function handleServerStartError(error: unknown) {
     console.error(`  ${npxCommand} qr`);
     console.error("");
     console.error("To stop the background server:");
-    console.error(`  kill -TERM ${existingPid}`);
+    console.error(`  ${npxCommand} stop`);
     console.error("");
     console.error(`Logs: ${logPath}`);
   } else {

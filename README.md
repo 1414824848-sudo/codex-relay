@@ -55,6 +55,7 @@ run.
 - Review active threads, queued inputs, approvals, and workspace state.
 - Preview git changes, local web output, files, and terminal surfaces from
   mobile.
+- Choose separate turn-complete and action-required push notifications.
 - Keep pairing and session data under your local relay state.
 
 ## Quick Start
@@ -90,20 +91,73 @@ npx codex-relay@latest approve XXXX-XXXX
 
 Your phone can now talk to your local Codex session.
 
+### 3. Optional: share a live session with your terminal
+
+The default relay uses its own Codex app-server process. To make mobile and a terminal TUI use the same shared app-server, start the relay with:
+
+```sh
+npx codex-relay@latest --shared-app-server
+```
+
+When a shared app-server is already running, the relay attaches to it instead of starting another one. If the relay's own socket connection resets, it reconnects without deliberately stopping the shared app-server.
+
+Then attach a new terminal TUI. On macOS, Linux, or WSL:
+
+```sh
+codex resume --remote unix://
+```
+
+On native Windows:
+
+```powershell
+codex resume --remote ws://127.0.0.1:8788
+```
+
+An already-running standalone TUI cannot be converted in place. Exit it and reconnect with `--remote`. Shared mode requires a recent Codex CLI with app-server and remote-resume support. It uses a Unix socket on macOS, Linux, and WSL, or a loopback-only WebSocket on Windows.
+
+Shared mode uses Codex's experimental app-server transport. A directly connected terminal TUI has its own WebSocket connection, which the relay cannot observe or reconnect. If that terminal reports a socket reset while the thread continues on mobile, reconnect it with the matching remote endpoint above and append the thread ID if needed.
+
+### Push notifications
+
+After pairing, open **Settings > Notifications** in the mobile app and enable either or both alerts:
+
+- **Turn complete** for completed or failed Codex turns
+- **Remaining usage** to include the lowest remaining Codex limit in turn-complete alerts
+- **Action required** for approval and input requests
+
+The relay uses the thread title as the notification title so you can identify the conversation. When **Remaining usage** is enabled, a turn-complete alert also includes the most constrained percentage reported by Codex. It does not send prompts, responses, commands, or approval text through the push service. Push support requires a native mobile build that includes `expo-notifications`; an OTA update alone cannot add that native module.
+
 ## Network Setup
 
 Your phone must be able to open the `Mobile:` URL printed by Codex Relay.
 
 - Same Wi-Fi usually works.
 - Tailscale is a good default when the devices are on different networks.
-- If the printed URL is not reachable from your phone, set
-  `CODEX_RELAY_PUBLIC_URL` to a reachable LAN, Tailscale, or tunnel URL.
 
-Example:
+### Tailscale and Web Previews
+
+Pairing only makes the Codex Relay server reachable. If you open a local web
+app from the mobile Web preview, that app's port must also be reachable from
+the phone.
+
+When using Tailscale, prefer [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
+for preview ports so the iOS WebView loads the site over HTTPS. For example,
+if your local app runs on `http://127.0.0.1:3000`:
 
 ```sh
-CODEX_RELAY_PUBLIC_URL=http://<computer-ip>:8787 npx codex-relay@latest
+tailscale serve 3000
 ```
+
+Tailscale prints an `https://<machine>.<tailnet>.ts.net` URL. Open that HTTPS
+URL in the mobile Web preview instead of `http://100.x.y.z:3000`. If the Web
+preview says App Transport Security requires a secure connection, the app is
+trying to load a plain HTTP URL; expose that same port with `tailscale serve`
+or another HTTPS tunnel and retry.
+
+The mobile Web preview also detects `http://100.x.y.z:<port>` and
+`http://<machine>.<tailnet>.ts.net:<port>` URLs. When detected, tap **Serve**
+in the Tailscale row to run Tailscale Serve for that port from the relay machine
+and switch the preview to the returned HTTPS URL automatically.
 
 ## Contributing
 
@@ -116,29 +170,40 @@ Before opening a connection issue, confirm the network checklist in the issue
 template. Most pairing failures happen because the phone cannot reach the relay
 URL printed by the computer.
 
+Changes to the published `codex-relay` package should include a changeset:
+
+```sh
+pnpm changeset
+```
+
+Commit the generated file with the change. The release workflow maintains a
+release pull request and publishes it after that pull request is merged. See
+[the Changesets guide](./.changeset/README.md) for the release process.
+
 ## Common Commands
 
-| Command                                    | What it does                                        |
-| ------------------------------------------ | --------------------------------------------------- |
-| `npx codex-relay@latest`                   | Start the relay and print a pairing QR.             |
-| `npx codex-relay@latest --bg`              | Keep the relay running in the background.           |
-| `npx codex-relay@latest qr`                | Print the current pairing QR for an existing relay. |
-| `npx codex-relay@latest approve XXXX-XXXX` | Approve a pending mobile pairing request.           |
-| `npx codex-relay@latest clear`             | Sign out every paired mobile app.                   |
+| Command                                      | What it does                                        |
+| -------------------------------------------- | --------------------------------------------------- |
+| `npx codex-relay@latest`                     | Start the relay and print a pairing QR.             |
+| `npx codex-relay@latest --bg`                | Keep the relay running in the background.           |
+| `npx codex-relay@latest --shared-app-server` | Share live sessions with an attached terminal TUI.  |
+| `npx codex-relay@latest qr`                  | Print the current pairing QR for an existing relay. |
+| `npx codex-relay@latest approve XXXX-XXXX`   | Approve a pending mobile pairing request.           |
+| `npx codex-relay@latest clear`               | Sign out every paired mobile app.                   |
 
 ## Configuration
 
 The relay listens on `0.0.0.0:8787` by default.
 
-| Variable                     | Purpose                                                             |
-| ---------------------------- | ------------------------------------------------------------------- |
-| `PORT`                       | Server port. Defaults to `8787`.                                    |
-| `HOST`                       | Listen host. Defaults to `0.0.0.0`.                                 |
-| `CODEX_RELAY_PUBLIC_URL`     | URL printed into the pairing QR, such as a Tailscale or tunnel URL. |
-| `CODEX_RELAY_WORKSPACE_PATH` | Workspace path Codex should use. Defaults to the current directory. |
-| `CODEX_RELAY_AUTH_DB_PATH`   | Pairing and session database path.                                  |
-| `CODEX_BIN`                  | Codex CLI executable path.                                          |
-| `CODEX_HOME`                 | Codex home directory for reading local session metadata.            |
+| Variable                      | Purpose                                                             |
+| ----------------------------- | ------------------------------------------------------------------- |
+| `PORT`                        | Server port. Defaults to `8787`.                                    |
+| `HOST`                        | Listen host. Defaults to `0.0.0.0`.                                 |
+| `CODEX_RELAY_WORKSPACE_PATH`  | Workspace path Codex should use. Defaults to the current directory. |
+| `CODEX_RELAY_AUTH_DB_PATH`    | Pairing and session database path.                                  |
+| `CODEX_RELAY_APP_SERVER_MODE` | `socket` for shared terminal/mobile sessions; defaults to `stdio`.  |
+| `CODEX_BIN`                   | Codex CLI executable path.                                          |
+| `CODEX_HOME`                  | Codex home directory for reading local session metadata.            |
 
 Background mode writes runtime files under `.codex-relay/` in the current
 workspace, including server logs, process state, and pairing data.
@@ -168,8 +233,6 @@ Connection checklist:
 - Can the phone open the exact `Mobile:` URL printed by the relay?
 - Does the computer firewall allow inbound traffic on the relay port, usually
   `8787`?
-- If the printed URL is not reachable, did you set `CODEX_RELAY_PUBLIC_URL` to
-  a reachable LAN, Tailscale, or tunnel URL?
 
 ## License
 

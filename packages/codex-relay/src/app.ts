@@ -15,21 +15,32 @@ import {
   ListWorkspaceDirectoriesResponseSchema,
   PairRequestSchema,
   PairResponseSchema,
+  PushNotificationSettingsResponseSchema,
   QueuedThreadInputActionResponseSchema,
   RateLimitsResponseSchema,
+  RenameThreadRequestSchema,
+  RenameThreadResponseSchema,
+  RewindThreadRequestSchema,
+  KnownReasoningEffortSchema,
+  ReasoningEffortSchema,
   ResolveApprovalRequestSchema,
   ResolveApprovalResponseSchema,
   RunThreadRequestSchema,
   RuntimePreferencesResponseSchema,
+  RegisterPushNotificationRequestSchema,
   StatusResponseSchema,
   StreamThreadRunEventSchema,
   StreamThreadRunRequestSchema,
   SubmitThreadInputResponseSchema,
   ThreadContextWindowResponseSchema,
   ThreadDetailResponseSchema,
+  ThreadGoalResponseSchema,
+  ThreadGoalSchema,
+  ThreadGoalStatusSchema,
   ThreadMessageDetailFieldSchema,
   ThreadMessageDetailResponseSchema,
   ThreadSummarySchema,
+  UpdateThreadGoalRequestSchema,
   UpdateWorkspaceFileContentRequestSchema,
   UpdateRuntimePreferencesRequestSchema,
   VersionResponseSchema,
@@ -41,9 +52,12 @@ import {
   WorkspaceTerminalResizeRequestSchema,
   WorkspaceTerminalSessionResponseSchema,
   WorkspaceTerminalStartRequestSchema,
+  WorkspaceTailscaleServeRequestSchema,
+  WorkspaceTailscaleServeResponseSchema,
   apiPaths,
   chatMessageDetailsFromPromptContext,
   createOpenApiDocument,
+  lowestRateLimitRemainingPercent,
   normalizePromptContext,
   promptMarkdownWithSkills,
   stripPromptSkillMentions,
@@ -62,6 +76,7 @@ import {
   type PromptAttachment,
   type PromptSkill,
   type ReasoningEffort,
+  type RenameThreadRequest,
   type RunThreadResponse,
   type RuntimeMode,
   type RuntimePreferences,
@@ -70,13 +85,16 @@ import {
   type StreamThreadRunEvent,
   type SubmitThreadInputResponse,
   type ThreadCollaborationMode,
+  type ThreadGoal,
   type ThreadMessageDetailField,
   type ThreadSummary,
+  type UpdateThreadGoalRequest,
   type UpdateWorkspaceFileContentRequest,
   type VersionResponse,
   type WebPreviewTarget,
   type WorkspaceFileContentResponse,
   type WorkspaceGitActionResponse,
+  type WorkspaceTailscaleServeResponse,
   type WorkspaceTerminalOutputResponse,
   type WorkspaceTerminalSessionResponse,
 } from "./api-schema.js";
@@ -93,7 +111,17 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir, hostname } from "node:os";
@@ -110,6 +138,7 @@ import {
   type AppServerRateLimits,
   type AppServerRequest,
   type AppServerThread,
+  type AppServerThreadGoal,
   type AppServerThreadItem,
   type AppServerTurn,
   type AppServerTurnStartParams,
@@ -126,7 +155,14 @@ import {
 import { readLatestContextWindowUsage } from "./context-window.js";
 import { codexRelayDataPath } from "./paths.js";
 import { relayDebugLog } from "./debug-log.js";
-import type { PairingSessionStore } from "./pairing-store.js";
+import { permanentClientSessionExpiresAt, type PairingSessionStore } from "./pairing-store.js";
+import {
+  createExpoPushNotificationSender,
+  createPushNotificationDispatcher,
+  type PushNotificationDispatcher,
+  type PushNotificationEvent,
+  type PushNotificationSender,
+} from "./push-notifications.js";
 import {
   createMemoryRuntimePreferencesStore,
   type RuntimePreferencesStore,
@@ -139,9 +175,14 @@ import {
   type ServerIdentity,
 } from "./secure-transport.js";
 import { listAvailableSkills } from "./skill-discovery.js";
+import {
+  startTailscaleServeForPreviewUrl,
+  TailscaleServeInvalidUrlError,
+} from "./tailscale-serve.js";
+import { resolveWorkspaceTerminalShell } from "./workspace-terminal-shell.js";
 
 const defaultWorkspacePath = process.cwd();
-const defaultCodexModel = "gpt-5.5";
+const defaultCodexModel = "gpt-6-astra";
 const execFileAsync = promisify(execFile);
 const IMAGE_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
 const WORKSPACE_FILE_PREVIEW_MAX_BYTES = 256 * 1024;
@@ -162,6 +203,10 @@ type AppOptions = {
   codex?: CodexClient;
   pairing?: PairingOptions;
   preferences?: RuntimePreferencesStore;
+  pushNotificationSender?: PushNotificationSender;
+  tailscaleServeForPreviewUrl?: (input: {
+    readonly url: string;
+  }) => Promise<WorkspaceTailscaleServeResponse>;
   workspacePath?: string;
 };
 
@@ -173,7 +218,6 @@ type PairingOptions = {
   createClientToken: () => string;
   hashClientToken: (token: string) => string;
   sessions: PairingSessionStore;
-  tokenTtlMs: number;
   onPaired?: (client: { clientName?: string; tokenCount: number }) => void;
   onPairAttempt?: (client: { remoteAddress?: string }) => void;
   onPairApprovalRequested?: (client: { approvalCode: string; clientName?: string }) => void;
@@ -197,6 +241,17 @@ const PairApproveRequestSchema = z.object({
   approvalCode: z.string().trim().min(1),
 });
 
+const AppServerThreadGoalPayloadSchema = z.object({
+  threadId: z.string().min(1),
+  objective: z.string().trim().min(1),
+  status: ThreadGoalStatusSchema,
+  tokenBudget: z.number().int().positive().nullable(),
+  tokensUsed: z.number().int().nonnegative(),
+  timeUsedSeconds: z.number().int().nonnegative(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+
 type PendingApproval = {
   appServer: CodexAppServerClient;
   kind:
@@ -207,8 +262,9 @@ type PendingApproval = {
     | "mcpElicitation";
   messageId?: string;
   method: string;
+  isBlocking?: boolean;
   questions?: PendingInputRequestQuestion[];
-  requestId: number;
+  requestId: number | string;
   threadId: string;
   turnId?: string;
 };
@@ -284,18 +340,124 @@ export function createApp(options: AppOptions = {}) {
   const pendingApprovals = new Map<string, PendingApproval>();
   const resolvedApprovals = new Map<string, ResolvedApproval>();
   const queuedInputsByThreadId = new Map<string, QueuedThreadInput[]>();
+  const threadOperationTails = new Map<string, Promise<void>>();
+  const appServerMutationTails = new Map<string, Promise<void>>();
   const workspaceTerminalSessions = new Map<string, WorkspaceTerminalSession>();
   const activeAppServerTurnIdsByThreadId = new Map<string, string>();
+  const appServerHistoryGenerationsByThreadId = new Map<string, number>();
   const appServerHistoryLoadsByThreadId = new Map<string, Promise<void>>();
+  const appServerRolloutPathsByThreadId = new Map<string, string>();
   const steeringThreads = new Set<string>();
   const secureSessionsByTokenHash = new Map<string, SecureSession>();
-  const activeStreamControllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
-  const threadOptions = { workingDirectory: workspacePath };
+  const activeStreamControllers = new Map<
+    ReadableStreamDefaultController<Uint8Array>,
+    () => void
+  >();
+  const threadOptions = { threadSource: "codex-relay", workingDirectory: workspacePath };
+  const advanceAppServerHistoryGeneration = (threadId: string) => {
+    appServerHistoryGenerationsByThreadId.set(
+      threadId,
+      (appServerHistoryGenerationsByThreadId.get(threadId) ?? 0) + 1,
+    );
+  };
+  const invalidateAppServerHistory = (threadId: string) => {
+    advanceAppServerHistoryGeneration(threadId);
+    appServerHistoryLoadsByThreadId.delete(threadId);
+    appServerRolloutPathsByThreadId.delete(threadId);
+    messagesByThreadId.delete(threadId);
+  };
+  if (appServer && typeof appServer.onNotification === "function") {
+    appServer.onNotification((notification) => {
+      const params = recordParams(notification);
+      const threadId = firstString(params, ["threadId"]);
+      if (!threadId) {
+        return;
+      }
+      if (notification.method === "thread/reverted") {
+        invalidateAppServerHistory(threadId);
+        return;
+      }
+      if (notification.method === "item/completed") {
+        advanceAppServerHistoryGeneration(threadId);
+        const item = params?.item;
+        if (
+          item &&
+          typeof item === "object" &&
+          (item as { type?: unknown }).type !== "userMessage"
+        ) {
+          upsertAppServerItemMessage(
+            messagesByThreadId,
+            threadId,
+            firstString(params, ["turnId"]),
+            item as AppServerThreadItem,
+          );
+        }
+        return;
+      }
+      if (notification.method === "turn/completed") {
+        advanceAppServerHistoryGeneration(threadId);
+        const turn = appServerTurnFromParams(params);
+        if (turn) {
+          for (const item of turn.items) {
+            if (item.type !== "userMessage") {
+              upsertAppServerItemMessage(messagesByThreadId, threadId, turn.id, item);
+            }
+          }
+        }
+      }
+    });
+  }
+  function runThreadOperation<T>(threadId: string, operation: () => Promise<T>) {
+    const previous = threadOperationTails.get(threadId) ?? Promise.resolve();
+    const result = previous.then(operation, operation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    threadOperationTails.set(threadId, tail);
+    void tail.finally(() => {
+      if (threadOperationTails.get(threadId) === tail) {
+        threadOperationTails.delete(threadId);
+      }
+    });
+    return result;
+  }
+  function runAppServerMutation<T>(threadId: string, operation: () => Promise<T>) {
+    const previous = appServerMutationTails.get(threadId) ?? Promise.resolve();
+    const result = previous.then(operation, operation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    appServerMutationTails.set(threadId, tail);
+    void tail.finally(() => {
+      if (appServerMutationTails.get(threadId) === tail) {
+        appServerMutationTails.delete(threadId);
+      }
+    });
+    return result;
+  }
+  const pushNotificationDispatcher = options.pairing
+    ? createPushNotificationDispatcher({
+        readRemainingUsagePercent: appServer
+          ? async () =>
+              lowestRateLimitRemainingPercent(
+                normalizeRateLimitBuckets(await appServer.readRateLimits()),
+              )
+          : undefined,
+        sender: options.pushNotificationSender ?? createExpoPushNotificationSender(),
+        sessions: options.pairing.sessions,
+      })
+    : undefined;
+  if (appServer && pushNotificationDispatcher) {
+    observeAppServerPushNotifications(appServer, pushNotificationDispatcher);
+  }
   const scheduleAppServerHistoryLoad = (threadId: string, cachedMessages: ChatMessage[]) => {
     if (!appServer || appServerHistoryLoadsByThreadId.has(threadId)) {
       return;
     }
     const startedAt = Date.now();
+    const historyGeneration = appServerHistoryGenerationsByThreadId.get(threadId) ?? 0;
     relayDebugLog("thread.detail.history.background_started", {
       cachedMessageCount: cachedMessages.length,
       threadId,
@@ -303,11 +465,18 @@ export function createApp(options: AppOptions = {}) {
     const load = appServer
       .readThread(threadId, { includeTurns: true })
       .then((threadWithTurns) => {
-        const mappedThread = rememberAppServerThread(threads, threadWithTurns);
-        const messages = mergeAppServerMessagesWithLocalStatus(
-          mapAppServerMessages(threadWithTurns),
-          messagesByThreadId.get(threadId) ?? cachedMessages,
-        );
+        if ((appServerHistoryGenerationsByThreadId.get(threadId) ?? 0) !== historyGeneration) {
+          return;
+        }
+        const hasCompleteHistory = appServerThreadHasCompleteHistory(threadWithTurns);
+        const mappedThread = rememberAppServerThread(threads, threadWithTurns, {
+          authoritativeMessageCount: hasCompleteHistory,
+        });
+        const appMessages = mapAppServerMessages(threadWithTurns);
+        const localMessages = messagesByThreadId.get(threadId) ?? cachedMessages;
+        const messages = hasCompleteHistory
+          ? mergeAppServerMessagesWithLocalStatus(appMessages, localMessages)
+          : mergeThreadMessagePages(appMessages, localMessages);
         messagesByThreadId.set(threadId, messages);
         relayDebugLog("thread.detail.history.background_completed", {
           durationMs: Date.now() - startedAt,
@@ -324,7 +493,9 @@ export function createApp(options: AppOptions = {}) {
         });
       })
       .finally(() => {
-        appServerHistoryLoadsByThreadId.delete(threadId);
+        if (appServerHistoryLoadsByThreadId.get(threadId) === load) {
+          appServerHistoryLoadsByThreadId.delete(threadId);
+        }
       });
     appServerHistoryLoadsByThreadId.set(threadId, load);
   };
@@ -346,7 +517,7 @@ export function createApp(options: AppOptions = {}) {
     const token = parseBearerToken(c.req.header("authorization"));
     const tokenHash = token ? options.pairing.hashClientToken(token) : undefined;
     const validSession = tokenHash
-      ? await options.pairing.sessions.getValidSession(tokenHash, Date.now())
+      ? await options.pairing.sessions.getValidSession(tokenHash)
       : undefined;
     if (!tokenHash || !validSession) {
       return c.json(apiError("unauthorized", "Pair this device with the Codex Relay server."), 401);
@@ -399,7 +570,7 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
-    await options.pairing.sessions.pruneExpired(Date.now());
+    await options.pairing.sessions.pruneExpiredPendingPairings(Date.now());
     const approvalCode = await createApprovalCode(options.pairing.sessions);
     const expiresAt = Date.now() + (options.pairing.approvalTtlMs ?? 5 * 60 * 1000);
     const requestOrigin = externalRequestOrigin(c.req.url, (name) => c.req.header(name));
@@ -449,11 +620,10 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
-    await options.pairing.sessions.pruneExpired(Date.now());
+    await options.pairing.sessions.pruneExpiredPendingPairings(Date.now());
     const clientToken = options.pairing.createClientToken();
-    const expiresAt = Date.now() + options.pairing.tokenTtlMs;
     const tokenHash = options.pairing.hashClientToken(clientToken);
-    const clientTokenExpiresAt = new Date(expiresAt).toISOString();
+    const clientTokenExpiresAt = new Date(permanentClientSessionExpiresAt).toISOString();
     const pairing = createSecurePairing({
       approvalCode,
       clientEphemeralPublicKey: pending.clientEphemeralPublicKey,
@@ -467,7 +637,6 @@ export function createApp(options: AppOptions = {}) {
     const tokenCount = await options.pairing.sessions.createSession(tokenHash, {
       clientSessionId: pending.clientSessionId,
       clientName: pending.clientName,
-      expiresAt,
       secureSession: pairing.session,
     });
     await options.pairing.sessions.deletePendingPairing(approvalCode);
@@ -534,7 +703,6 @@ export function createApp(options: AppOptions = {}) {
     }
 
     const clientToken = options.pairing.createClientToken();
-    const expiresAt = Date.now() + options.pairing.tokenTtlMs;
     const oldTokenHash = options.pairing.hashClientToken(oldToken);
     const newTokenHash = options.pairing.hashClientToken(clientToken);
     const clientSessionId =
@@ -543,7 +711,6 @@ export function createApp(options: AppOptions = {}) {
     const tokenCount = await options.pairing.sessions.rotateSession(oldTokenHash, newTokenHash, {
       clientSessionId,
       clientName: oldSession.clientName,
-      expiresAt,
       secureSession: secureSessionsByTokenHash.get(oldTokenHash) ?? oldSession.secureSession,
     });
     const secureSession = secureSessionsByTokenHash.get(oldTokenHash) ?? oldSession.secureSession;
@@ -557,7 +724,7 @@ export function createApp(options: AppOptions = {}) {
 
     const response: PairResponse = PairResponseSchema.parse({
       clientToken,
-      clientTokenExpiresAt: new Date(expiresAt).toISOString(),
+      clientTokenExpiresAt: new Date(permanentClientSessionExpiresAt).toISOString(),
     });
     const jsonResponse = await secureJson(
       c,
@@ -639,6 +806,123 @@ export function createApp(options: AppOptions = {}) {
       preferences: await preferences.update(parsed.data, workspacePath),
       runtimePreferencesByWorkspacePath: await preferences.readByWorkspacePath(),
       workspacePath,
+    });
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.get(apiPaths.pushNotifications, async (c) => {
+    const clientSessionId = await pairedClientSessionIdForAuthorization(
+      c.req.header("authorization"),
+      options.pairing,
+    );
+    if (!clientSessionId) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(
+          "push_notifications_unavailable",
+          "Pair this device again to manage notifications.",
+        ),
+        401,
+      );
+    }
+
+    const subscription =
+      await options.pairing!.sessions.getPushNotificationSubscription(clientSessionId);
+    const response = PushNotificationSettingsResponseSchema.parse({
+      preferences: subscription
+        ? {
+            actionRequired: subscription.actionRequired,
+            includeRemainingUsage: subscription.includeRemainingUsage,
+            turnTerminal: subscription.turnTerminal,
+          }
+        : defaultPushNotificationPreferences(),
+      registered: Boolean(subscription),
+    });
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.put(apiPaths.pushNotifications, async (c) => {
+    if (!options.pairing) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("pairing_required", "Pair this device before registering notifications."),
+        404,
+      );
+    }
+    const parsed = await parseRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      RegisterPushNotificationRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+
+    const clientSessionId = await pairedClientSessionIdForAuthorization(
+      c.req.header("authorization"),
+      options.pairing,
+    );
+    if (!clientSessionId) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(
+          "push_notifications_unavailable",
+          "Pair this device again to manage notifications.",
+        ),
+        401,
+      );
+    }
+
+    await options.pairing.sessions.upsertPushNotificationSubscription({
+      actionRequired: parsed.data.preferences.actionRequired,
+      clientSessionId,
+      expoPushToken: parsed.data.expoPushToken,
+      includeRemainingUsage: parsed.data.preferences.includeRemainingUsage,
+      platform: parsed.data.platform,
+      turnTerminal: parsed.data.preferences.turnTerminal,
+    });
+    const response = PushNotificationSettingsResponseSchema.parse({
+      preferences: parsed.data.preferences,
+      registered: true,
+    });
+    return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.delete(apiPaths.pushNotifications, async (c) => {
+    const clientSessionId = await pairedClientSessionIdForAuthorization(
+      c.req.header("authorization"),
+      options.pairing,
+    );
+    if (!clientSessionId) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(
+          "push_notifications_unavailable",
+          "Pair this device again to manage notifications.",
+        ),
+        401,
+      );
+    }
+
+    await options.pairing!.sessions.deletePushNotificationSubscription(clientSessionId);
+    const response = PushNotificationSettingsResponseSchema.parse({
+      preferences: defaultPushNotificationPreferences(),
+      registered: false,
     });
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
   });
@@ -902,6 +1186,46 @@ export function createApp(options: AppOptions = {}) {
     }
   });
 
+  app.post(apiPaths.workspaceTailscaleServe, async (c) => {
+    const parsed = await parseRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      WorkspaceTailscaleServeRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+
+    try {
+      const servePreviewUrl =
+        options.tailscaleServeForPreviewUrl ?? startTailscaleServeForPreviewUrl;
+      const serve = await servePreviewUrl({ url: parsed.data.url });
+      const response: WorkspaceTailscaleServeResponse =
+        WorkspaceTailscaleServeResponseSchema.parse(serve);
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+    } catch (error) {
+      const status = error instanceof TailscaleServeInvalidUrlError ? 400 : 502;
+      const code =
+        error instanceof TailscaleServeInvalidUrlError
+          ? "invalid_tailscale_preview_url"
+          : "tailscale_serve_failed";
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(code, errorMessage(error)),
+        status,
+      );
+    }
+  });
+
   app.get("/v1/workspace/terminal/sessions/:sessionId/output", async (c) => {
     const session = workspaceTerminalSessions.get(c.req.param("sessionId"));
     if (!session) {
@@ -975,7 +1299,7 @@ export function createApp(options: AppOptions = {}) {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         streamController = controller;
-        activeStreamControllers.add(controller);
+        activeStreamControllers.set(controller, closeStream);
         send(workspaceTerminalOutputResponse(session, since));
         if (session.exitedAt) {
           return;
@@ -1092,11 +1416,18 @@ export function createApp(options: AppOptions = {}) {
   app.get(apiPaths.models, async (c) => {
     try {
       const models = appServer ? await appServer.listModels() : fallbackModels();
+      const hasAstra = models.some((model) => model.model === defaultCodexModel);
       return secureJson(
         c,
         options.pairing,
         secureSessionsByTokenHash,
-        ListModelsResponseSchema.parse({ models: models.map(mapAppServerModel) }),
+        ListModelsResponseSchema.parse({
+          models: models.map((model) =>
+            mapAppServerModel(
+              hasAstra ? { ...model, isDefault: model.model === defaultCodexModel } : model,
+            ),
+          ),
+        }),
       );
     } catch {
       return secureJson(
@@ -1430,7 +1761,9 @@ export function createApp(options: AppOptions = {}) {
       try {
         const appServerThreads = await appServer.listThreads();
         const response: ListThreadsResponse = ListThreadsResponseSchema.parse({
-          threads: appServerThreads.map((thread) => rememberAppServerThread(threads, thread)),
+          threads: appServerThreads
+            .filter((thread) => !isSubagentThread(thread))
+            .map((thread) => rememberAppServerThread(threads, thread)),
           source: "app-server",
         });
         return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
@@ -1461,7 +1794,9 @@ export function createApp(options: AppOptions = {}) {
         const appServerThreads = await appServer.listThreads();
         const response: ArchiveThreadResponse = ArchiveThreadResponseSchema.parse({
           archivedThreadId: threadId,
-          threads: appServerThreads.map((thread) => rememberAppServerThread(threads, thread)),
+          threads: appServerThreads
+            .filter((thread) => !isSubagentThread(thread))
+            .map((thread) => rememberAppServerThread(threads, thread)),
           source: "app-server",
         });
         return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
@@ -1501,13 +1836,242 @@ export function createApp(options: AppOptions = {}) {
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
   });
 
+  app.post("/v1/threads/:threadId/name", async (c) => {
+    const threadId = c.req.param("threadId");
+    if (!appServer) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("unsupported", "Renaming threads requires the Codex app-server."),
+        409,
+      );
+    }
+    const knownThread = await ensureKnownThread({
+      appServer,
+      threadId,
+      messagesByThreadId,
+      threads,
+    });
+    if (!knownThread) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("not_found", `Thread ${threadId} is not known to this server.`),
+        404,
+      );
+    }
+
+    const parsed = await parseRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      RenameThreadRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+
+    try {
+      const body: RenameThreadRequest = parsed.data;
+      const thread = await runAppServerMutation(threadId, async () => {
+        await appServer.setThreadName({ name: body.title, threadId });
+        return rememberAppServerThread(
+          threads,
+          await appServer.readThread(threadId, { includeTurns: false }),
+        );
+      });
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        RenameThreadResponseSchema.parse({ thread }),
+      );
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = /not found|no rollout found/i.test(message) ? 404 : 502;
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(status === 404 ? "not_found" : "rename_unavailable", message),
+        status,
+      );
+    }
+  });
+
+  app.post("/v1/threads/:threadId/rollback", async (c) => {
+    const threadId = c.req.param("threadId");
+    if (!appServer) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("unsupported", "Rewinding threads requires the Codex app-server."),
+        409,
+      );
+    }
+
+    const parsed = await parseRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      RewindThreadRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+
+    return runThreadOperation(threadId, () =>
+      runAppServerMutation(threadId, async () => {
+        try {
+          const threadBeforeRewind = await appServer.readThread(threadId, { includeTurns: true });
+          if (isSubagentThread(threadBeforeRewind)) {
+            return secureJson(
+              c,
+              options.pairing,
+              secureSessionsByTokenHash,
+              apiError("not_found", `Thread ${threadId} is not known to this server.`),
+              404,
+            );
+          }
+          if (
+            mapAppServerThreadState(threadBeforeRewind.status, threadBeforeRewind.turns) ===
+              "running" ||
+            activeAppServerTurnIdsByThreadId.has(threadId)
+          ) {
+            return secureJson(
+              c,
+              options.pairing,
+              secureSessionsByTokenHash,
+              apiError("thread_running", "Stop the current turn before rewinding this chat."),
+              409,
+            );
+          }
+
+          const turns = threadBeforeRewind.turns ?? [];
+          const turnIndex = turns.findIndex((turn) => turn.id === parsed.data.turnId);
+          if (turnIndex < 0) {
+            return secureJson(
+              c,
+              options.pairing,
+              secureSessionsByTokenHash,
+              apiError("not_found", "The selected message is no longer available to rewind."),
+              404,
+            );
+          }
+
+          const rollbackThread = () =>
+            appServer.rollbackThread({
+              threadId,
+              numTurns: turns.length - turnIndex,
+            });
+          let rolledBackThread: AppServerThread;
+          try {
+            if (
+              threadBeforeRewind.historyMode === "paginated" &&
+              typeof appServer.revertThread === "function"
+            ) {
+              try {
+                rolledBackThread = await appServer.revertThread({
+                  beforeTurnId: parsed.data.turnId,
+                  threadId,
+                });
+              } catch (error) {
+                if (!isMissingAppServerMethodError(error, "thread/revert")) {
+                  throw error;
+                }
+                rolledBackThread = await rollbackThread();
+              }
+            } else {
+              rolledBackThread = await rollbackThread();
+            }
+          } catch (error) {
+            // Codex 0.156 removed `thread/rollback`; `thread/revert` only accepts paginated history.
+            if (!isMissingAppServerMethodError(error, "thread/rollback")) {
+              throw error;
+            }
+            return secureJson(
+              c,
+              options.pairing,
+              secureSessionsByTokenHash,
+              apiError(
+                "rewind_unsupported",
+                "This chat uses Codex's legacy history format, which this Codex version can no longer rewind. Chats started after the update can be rewound.",
+              ),
+              409,
+            );
+          }
+          const threadWithTurns =
+            rolledBackThread.turns === undefined
+              ? await appServer.readThread(threadId, { includeTurns: true })
+              : rolledBackThread;
+          const thread = rememberAppServerThread(threads, threadWithTurns, {
+            authoritativeMessageCount: true,
+          });
+          const messages = mapAppServerMessages(threadWithTurns);
+          invalidateAppServerHistory(threadId);
+          messagesByThreadId.set(threadId, messages);
+          liveThreads.delete(threadId);
+          activeAppServerTurnIdsByThreadId.delete(threadId);
+          queuedInputsByThreadId.delete(threadId);
+          steeringThreads.delete(threadId);
+
+          return secureJson(
+            c,
+            options.pairing,
+            secureSessionsByTokenHash,
+            threadDetailResponse({
+              thread,
+              messages,
+              pendingInputRequests: [],
+            }),
+          );
+        } catch (error) {
+          const message = errorMessage(error);
+          const status = /not found|no rollout found/i.test(message) ? 404 : 502;
+          return secureJson(
+            c,
+            options.pairing,
+            secureSessionsByTokenHash,
+            apiError(status === 404 ? "not_found" : "rewind_unavailable", message),
+            status,
+          );
+        }
+      }),
+    );
+  });
+
   app.get("/v1/threads/:threadId", async (c) => {
     const threadId = c.req.param("threadId");
+    const forceRefresh = c.req.query("refresh") === "true";
     const detailStartedAt = Date.now();
     relayDebugLog("thread.detail.requested", {
       threadId,
     });
     const knownThread = threads.get(threadId);
+    if (knownThread && isSubagentThread(knownThread)) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("not_found", `Thread ${threadId} is not known to this server.`),
+        404,
+      );
+    }
     const wasKnownRunning =
       knownThread?.state === "running" || activeAppServerTurnIdsByThreadId.has(threadId);
     if (appServer) {
@@ -1515,41 +2079,84 @@ export function createApp(options: AppOptions = {}) {
         const thread = await appServer.readThread(threadId, {
           includeTurns: false,
         });
+        if (isSubagentThread(thread)) {
+          return secureJson(
+            c,
+            options.pairing,
+            secureSessionsByTokenHash,
+            apiError("not_found", `Thread ${threadId} is not known to this server.`),
+            404,
+          );
+        }
         const mappedThread = rememberAppServerThread(threads, thread);
-        const cachedMessages = messagesByThreadId.get(threadId) ?? [];
+        let cachedMessages = messagesByThreadId.get(threadId) ?? [];
+        if (thread.path) {
+          const previousRolloutPath = appServerRolloutPathsByThreadId.get(threadId);
+          if (previousRolloutPath && previousRolloutPath !== thread.path) {
+            invalidateAppServerHistory(threadId);
+            cachedMessages = [];
+          }
+          appServerRolloutPathsByThreadId.set(threadId, thread.path);
+        }
         let loadedMessages = false;
         let messages = cachedMessages;
         let responseThread = preserveKnownRunningThreadState(mappedThread, wasKnownRunning);
 
-        const rolloutHistory = readRolloutThreadMessages(threadId, workspacePath);
-        if (rolloutHistory.messages.length > 0) {
-          messages = mergeThreadMessagePages(rolloutHistory.messages, cachedMessages);
-          responseThread = rememberRolloutThreadMessages(
-            threads,
-            responseThread,
-            messages,
-            rolloutHistory.messageCountLowerBound,
-          );
-          responseThread = preserveKnownRunningThreadState(responseThread, wasKnownRunning);
+        if (forceRefresh && responseThread.state !== "running") {
+          const threadWithTurns = await appServer.readThread(threadId, {
+            includeTurns: true,
+          });
+          const hasCompleteHistory = appServerThreadHasCompleteHistory(threadWithTurns);
+          responseThread = rememberAppServerThread(threads, threadWithTurns, {
+            authoritativeMessageCount: hasCompleteHistory,
+          });
+          const appMessages = mapAppServerMessages(threadWithTurns);
+          messages = hasCompleteHistory
+            ? mergeAppServerMessagesWithLocalStatus(appMessages, cachedMessages)
+            : mergeThreadMessagePages(appMessages, cachedMessages);
           messagesByThreadId.set(threadId, messages);
           loadedMessages = true;
-        } else if (cachedMessages.length > 0) {
-          messages = dedupeThreadMessages(cachedMessages);
-          if (messages.length !== cachedMessages.length) {
-            messagesByThreadId.set(threadId, messages);
+        } else {
+          const rolloutHistory = readRolloutThreadMessages(
+            threadId,
+            workspacePath,
+            thread.path ?? undefined,
+          );
+          if (rolloutHistory.rolloutPath) {
+            appServerRolloutPathsByThreadId.set(threadId, rolloutHistory.rolloutPath);
           }
-          loadedMessages = true;
+          if (rolloutHistory.messages.length > 0) {
+            messages = mergeThreadMessagePages(rolloutHistory.messages, cachedMessages);
+            responseThread = rememberRolloutThreadMessages(
+              threads,
+              responseThread,
+              messages,
+              rolloutHistory.messageCountLowerBound,
+            );
+            responseThread = preserveKnownRunningThreadState(responseThread, wasKnownRunning);
+            messagesByThreadId.set(threadId, messages);
+            loadedMessages = true;
+          } else if (cachedMessages.length > 0) {
+            messages = dedupeThreadMessages(cachedMessages);
+            if (messages.length !== cachedMessages.length) {
+              messagesByThreadId.set(threadId, messages);
+            }
+            loadedMessages = true;
+          }
         }
 
         if (!loadedMessages && responseThread.state !== "running") {
           const threadWithTurns = await appServer.readThread(threadId, {
             includeTurns: true,
           });
-          responseThread = rememberAppServerThread(threads, threadWithTurns);
-          messages = mergeAppServerMessagesWithLocalStatus(
-            mapAppServerMessages(threadWithTurns),
-            cachedMessages,
-          );
+          const hasCompleteHistory = appServerThreadHasCompleteHistory(threadWithTurns);
+          responseThread = rememberAppServerThread(threads, threadWithTurns, {
+            authoritativeMessageCount: hasCompleteHistory,
+          });
+          const appMessages = mapAppServerMessages(threadWithTurns);
+          messages = hasCompleteHistory
+            ? mergeAppServerMessagesWithLocalStatus(appMessages, cachedMessages)
+            : mergeThreadMessagePages(appMessages, cachedMessages);
           messagesByThreadId.set(threadId, messages);
           loadedMessages = true;
         } else if (!loadedMessages) {
@@ -1746,6 +2353,153 @@ export function createApp(options: AppOptions = {}) {
         usage: result.usage,
       }),
     );
+  });
+
+  app.get("/v1/threads/:threadId/goal", async (c) => {
+    const threadId = c.req.param("threadId");
+    if (!appServer) {
+      const thread = threads.get(threadId);
+      if (!thread) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Thread ${threadId} is not known to this server.`),
+          404,
+        );
+      }
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        ThreadGoalResponseSchema.parse({ goal: thread.goal ?? null, thread }),
+      );
+    }
+
+    try {
+      const thread = rememberAppServerThread(
+        threads,
+        await appServer.readThread(threadId, { includeTurns: false }),
+      );
+      const goal = mapAppServerThreadGoal(await appServer.getThreadGoal({ threadId }));
+      const threadWithGoal = rememberThreadGoal(threads, thread, goal);
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        ThreadGoalResponseSchema.parse({ goal, thread: threadWithGoal }),
+      );
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = /not found|no rollout found/i.test(message) ? 404 : 502;
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(status === 404 ? "not_found" : "goal_unavailable", message),
+        status,
+      );
+    }
+  });
+
+  app.post("/v1/threads/:threadId/goal", async (c) => {
+    const threadId = c.req.param("threadId");
+    if (!appServer) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("unsupported", "Thread goals require the Codex app-server."),
+        409,
+      );
+    }
+
+    const parsed = await parseRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      UpdateThreadGoalRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+
+    try {
+      const body: UpdateThreadGoalRequest = parsed.data;
+      const thread = rememberAppServerThread(
+        threads,
+        await appServer.readThread(threadId, { includeTurns: false }),
+      );
+      const goal = mapAppServerThreadGoal(
+        await appServer.setThreadGoal({
+          threadId,
+          objective: body.objective,
+          status: body.status,
+          tokenBudget: body.tokenBudget,
+        }),
+      );
+      const threadWithGoal = rememberThreadGoal(threads, thread, goal);
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        ThreadGoalResponseSchema.parse({ goal, thread: threadWithGoal }),
+      );
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = /not found|no rollout found/i.test(message) ? 404 : 502;
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(status === 404 ? "not_found" : "goal_unavailable", message),
+        status,
+      );
+    }
+  });
+
+  app.delete("/v1/threads/:threadId/goal", async (c) => {
+    const threadId = c.req.param("threadId");
+    if (!appServer) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("unsupported", "Thread goals require the Codex app-server."),
+        409,
+      );
+    }
+
+    try {
+      const thread = rememberAppServerThread(
+        threads,
+        await appServer.readThread(threadId, { includeTurns: false }),
+      );
+      await appServer.clearThreadGoal({ threadId });
+      const threadWithoutGoal = rememberThreadGoal(threads, thread, null);
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        ThreadGoalResponseSchema.parse({ goal: null, thread: threadWithoutGoal }),
+      );
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = /not found|no rollout found/i.test(message) ? 404 : 502;
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(status === 404 ? "not_found" : "goal_unavailable", message),
+        status,
+      );
+    }
   });
 
   app.get("/openapi.json", (c) =>
@@ -1980,87 +2734,89 @@ export function createApp(options: AppOptions = {}) {
 
   app.post("/v1/threads/:threadId/input", async (c) => {
     const threadId = c.req.param("threadId");
-    const knownThread = await ensureKnownThread({
-      appServer,
-      threadId,
-      messagesByThreadId,
-      threads,
-    });
-    if (!knownThread) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("not_found", `Thread ${threadId} is not known to this server.`),
-        404,
-      );
-    }
-    if (!appServer) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("unsupported", "Running-thread input requires the Codex app-server."),
-        409,
-      );
-    }
-    if (knownThread.state !== "running") {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("thread_not_running", `Thread ${threadId} is not currently running.`),
-        409,
-      );
-    }
+    return runThreadOperation(threadId, async () => {
+      const knownThread = await ensureKnownThread({
+        appServer,
+        threadId,
+        messagesByThreadId,
+        threads,
+      });
+      if (!knownThread) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Thread ${threadId} is not known to this server.`),
+          404,
+        );
+      }
+      if (!appServer) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("unsupported", "Running-thread input requires the Codex app-server."),
+          409,
+        );
+      }
+      if (knownThread.state !== "running") {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("thread_not_running", `Thread ${threadId} is not currently running.`),
+          409,
+        );
+      }
 
-    const parsed = await parseRequestJson(
-      c,
-      options.pairing,
-      secureSessionsByTokenHash,
-      RunThreadRequestSchema,
-    );
-    if (!parsed.success) {
-      return secureJson(
+      const parsed = await parseRequestJson(
         c,
         options.pairing,
         secureSessionsByTokenHash,
-        validationError(parsed.error),
-        400,
+        RunThreadRequestSchema,
       );
-    }
+      if (!parsed.success) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          validationError(parsed.error),
+          400,
+        );
+      }
 
-    const runOptions = withRuntimePreferences(
-      await preferences.read(knownThread.cwd ?? workspacePath),
-      parsed.data,
-    );
-    const skills = runOptions.skills ?? [];
-    const prompt = runOptions.prompt;
-    const queuedInputs = queuedInputsByThreadId.get(threadId) ?? [];
-    const queuedInput: QueuedThreadInput = {
-      attachments: runOptions.attachments ?? [],
-      id: randomUUID(),
-      prompt,
-      runOptions,
-      skills,
-      workspacePath: knownThread.cwd ?? workspacePath,
-    };
-    queuedInputs.push(queuedInput);
-    queuedInputsByThreadId.set(threadId, queuedInputs);
+      const runOptions = withRuntimePreferences(
+        await preferences.read(knownThread.cwd ?? workspacePath),
+        parsed.data,
+      );
+      const skills = runOptions.skills ?? [];
+      const prompt = runOptions.prompt;
+      const queuedInputs = queuedInputsByThreadId.get(threadId) ?? [];
+      const queuedInput: QueuedThreadInput = {
+        attachments: runOptions.attachments ?? [],
+        id: randomUUID(),
+        prompt,
+        runOptions,
+        skills,
+        workspacePath: knownThread.cwd ?? workspacePath,
+      };
+      queuedInputs.push(queuedInput);
+      queuedInputsByThreadId.set(threadId, queuedInputs);
 
-    const thread = updateThread(threads, messagesByThreadId, threadId, {
-      state: "running",
-      lastPrompt: promptWithAttachmentReferences(prompt, runOptions.attachments ?? []),
-      lastError: undefined,
-      ...runtimeMetadataFromOptions(runOptions),
+      const thread = updateThread(threads, messagesByThreadId, threadId, {
+        state: "running",
+        lastPrompt: promptWithAttachmentReferences(prompt, runOptions.attachments ?? []),
+        lastError: undefined,
+        ...runtimeMetadataFromOptions(runOptions),
+      });
+      const response: SubmitThreadInputResponse = SubmitThreadInputResponseSchema.parse({
+        acceptedAs: "queued",
+        input: queuedThreadInputSummary(queuedInput),
+        queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
+        thread,
+      });
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 202);
     });
-    const response: SubmitThreadInputResponse = SubmitThreadInputResponseSchema.parse({
-      acceptedAs: "queued",
-      input: queuedThreadInputSummary(queuedInput),
-      queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
-      thread,
-    });
-    return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 202);
   });
 
   app.delete("/v1/threads/:threadId/input/:inputId", async (c) => {
@@ -2097,63 +2853,67 @@ export function createApp(options: AppOptions = {}) {
   app.post("/v1/threads/:threadId/input/:inputId/steer", async (c) => {
     const threadId = c.req.param("threadId");
     const inputId = c.req.param("inputId");
-    const knownThread = await ensureKnownThread({
-      appServer,
-      threadId,
-      messagesByThreadId,
-      threads,
-    });
-    if (!knownThread) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("not_found", `Thread ${threadId} is not known to this server.`),
-        404,
-      );
-    }
-    if (!appServer) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("unsupported", "Running-thread input requires the Codex app-server."),
-        409,
-      );
-    }
-    if (knownThread.state !== "running") {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("thread_not_running", `Thread ${threadId} is not currently running.`),
-        409,
-      );
-    }
-    const queuedInput = removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
-    if (!queuedInput) {
-      return secureJson(
-        c,
-        options.pairing,
-        secureSessionsByTokenHash,
-        apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
-        404,
-      );
-    }
+    return runThreadOperation(threadId, async () => {
+      const knownThread = await ensureKnownThread({
+        appServer,
+        threadId,
+        messagesByThreadId,
+        threads,
+      });
+      if (!knownThread) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Thread ${threadId} is not known to this server.`),
+          404,
+        );
+      }
+      if (!appServer) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("unsupported", "Running-thread input requires the Codex app-server."),
+          409,
+        );
+      }
+      if (knownThread.state !== "running") {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("thread_not_running", `Thread ${threadId} is not currently running.`),
+          409,
+        );
+      }
+      const queuedInput = removeQueuedInput(queuedInputsByThreadId, threadId, inputId);
+      if (!queuedInput) {
+        return secureJson(
+          c,
+          options.pairing,
+          secureSessionsByTokenHash,
+          apiError("not_found", `Queued input ${inputId} is not known to this thread.`),
+          404,
+        );
+      }
 
-    steeringThreads.add(threadId);
-    await startAppServerTurn(appServer, threadId, queuedInput);
-    const thread = updateThread(threads, messagesByThreadId, threadId, {
-      state: "running",
-      lastPrompt: promptWithAttachmentReferences(queuedInput.prompt, queuedInput.attachments),
-      lastError: undefined,
+      steeringThreads.add(threadId);
+      await runAppServerMutation(threadId, () =>
+        startAppServerTurn(appServer, threadId, queuedInput),
+      );
+      const thread = updateThread(threads, messagesByThreadId, threadId, {
+        state: "running",
+        lastPrompt: promptWithAttachmentReferences(queuedInput.prompt, queuedInput.attachments),
+        lastError: undefined,
+      });
+      const response = QueuedThreadInputActionResponseSchema.parse({
+        input: queuedThreadInputSummary(queuedInput),
+        queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
+        thread,
+      });
+      return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 202);
     });
-    const response = QueuedThreadInputActionResponseSchema.parse({
-      input: queuedThreadInputSummary(queuedInput),
-      queueLength: queuedInputsByThreadId.get(threadId)?.length ?? 0,
-      thread,
-    });
-    return secureJson(c, options.pairing, secureSessionsByTokenHash, response, 202);
   });
 
   app.post("/v1/threads/:threadId/runs/interrupt", async (c) => {
@@ -2315,20 +3075,32 @@ export function createApp(options: AppOptions = {}) {
     });
     const encoder = new TextEncoder();
     const secureSession = getSecureSessionForRequest(c, options.pairing, secureSessionsByTokenHash);
-    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
     let streamSettled = false;
+    let closeStream = () => {};
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        streamController = controller;
-        activeStreamControllers.add(controller);
+        const attachmentAbortController = new AbortController();
+        let closed = false;
+        let stopPreviewMonitor = () => {};
+        closeStream = () => {
+          if (closed) {
+            return;
+          }
+          closed = true;
+          stopPreviewMonitor();
+          attachmentAbortController.abort();
+          activeStreamControllers.delete(controller);
+          closeSseController(controller);
+        };
+        activeStreamControllers.set(controller, closeStream);
         relayDebugLog("thread.stream.started", {
           mode: !runOptions.prompt && appServer ? "attach" : "run",
           threadId,
         });
-        const stopPreviewMonitor = startWebPreviewTargetMonitor({
+        stopPreviewMonitor = startWebPreviewTargetMonitor({
           bridgeUrl: c.req.url,
           send(target) {
-            sendSse(controller, encoder, secureSession, {
+            return sendSse(controller, encoder, secureSession, {
               type: "thread.preview_target.detected",
               threadId,
               target,
@@ -2343,13 +3115,13 @@ export function createApp(options: AppOptions = {}) {
             messagesByThreadId,
             pendingApprovals,
             secureSession,
+            signal: attachmentAbortController.signal,
             threadId,
             threads,
           }).finally(() => {
             streamSettled = true;
             relayDebugLog("thread.stream.finished", { mode: "attach", threadId });
-            activeStreamControllers.delete(controller);
-            stopPreviewMonitor();
+            closeStream();
           });
           return;
         }
@@ -2363,11 +3135,9 @@ export function createApp(options: AppOptions = {}) {
               "Running-thread stream attachment requires the Codex app-server.",
             ).error,
           });
-          closeSseController(controller);
           streamSettled = true;
           relayDebugLog("thread.stream.finished", { mode: "unsupported", threadId });
-          activeStreamControllers.delete(controller);
-          stopPreviewMonitor();
+          closeStream();
           return;
         }
         const skills = runOptions.skills ?? [];
@@ -2382,6 +3152,8 @@ export function createApp(options: AppOptions = {}) {
           messagesByThreadId,
           pendingApprovals,
           queuedInputsByThreadId,
+          runAppServerMutation,
+          runThreadOperation,
           prompt,
           attachments: runOptions.attachments ?? [],
           secureSession,
@@ -2394,14 +3166,11 @@ export function createApp(options: AppOptions = {}) {
         }).finally(() => {
           streamSettled = true;
           relayDebugLog("thread.stream.finished", { mode: "run", threadId });
-          activeStreamControllers.delete(controller);
-          stopPreviewMonitor();
+          closeStream();
         });
       },
       cancel(reason) {
-        if (streamController) {
-          activeStreamControllers.delete(streamController);
-        }
+        closeStream();
         relayDebugLog("thread.stream.cancelled_by_client", {
           reason: debugReason(reason),
           settled: streamSettled,
@@ -2425,6 +3194,25 @@ export function createApp(options: AppOptions = {}) {
 function parseBearerToken(value: string | undefined) {
   const match = value?.match(/^Bearer\s+(.+)$/i);
   return match?.[1];
+}
+
+async function pairedClientSessionIdForAuthorization(
+  authorization: string | undefined,
+  pairing: PairingOptions | undefined,
+) {
+  if (!pairing) {
+    return undefined;
+  }
+  const token = parseBearerToken(authorization);
+  if (!token) {
+    return undefined;
+  }
+  const session = await pairing.sessions.getValidSession(pairing.hashClientToken(token));
+  return session?.clientSessionId;
+}
+
+function defaultPushNotificationPreferences() {
+  return { actionRequired: false, includeRemainingUsage: false, turnTerminal: false };
 }
 
 function normalizeApprovalCode(value: string) {
@@ -2468,7 +3256,7 @@ async function createApprovalCode(sessions: PairingSessionStore) {
 }
 
 async function getValidClientSession(pairing: PairingOptions, token: string) {
-  return pairing.sessions.getValidSession(pairing.hashClientToken(token), Date.now());
+  return pairing.sessions.getValidSession(pairing.hashClientToken(token));
 }
 
 function externalRequestOrigin(requestUrl: string, header: (name: string) => string | undefined) {
@@ -2539,11 +3327,10 @@ async function createAppServerThreadRecord(input: {
   const thread = await input.appServer.startThread({
     approvalPolicy: runtime.approvalPolicy,
     cwd: input.workspacePath,
-    experimentalRawEvents: false,
     model: input.options.model ?? null,
-    persistExtendedHistory: true,
     sandbox: runtime.sandbox,
     serviceTier: input.options.serviceTier ?? null,
+    threadSource: "codex-relay",
   });
   const metadata = ThreadSummarySchema.parse({
     ...mapAppServerThread({
@@ -2670,6 +3457,8 @@ async function runPromptStreamed(input: {
   messagesByThreadId: Map<string, ChatMessage[]>;
   pendingApprovals: Map<string, PendingApproval>;
   queuedInputsByThreadId: Map<string, QueuedThreadInput[]>;
+  runAppServerMutation: <T>(threadId: string, operation: () => Promise<T>) => Promise<T>;
+  runThreadOperation: <T>(threadId: string, operation: () => Promise<T>) => Promise<T>;
   prompt: string;
   secureSession?: SecureSessionHandle;
   steeringThreads: Set<string>;
@@ -2697,6 +3486,8 @@ async function runPromptStreamed(input: {
       messagesByThreadId: input.messagesByThreadId,
       pendingApprovals: input.pendingApprovals,
       queuedInputsByThreadId: input.queuedInputsByThreadId,
+      runAppServerMutation: input.runAppServerMutation,
+      runThreadOperation: input.runThreadOperation,
       prompt: input.prompt,
       runOptions: input.runOptions,
       secureSession: input.secureSession,
@@ -2808,6 +3599,13 @@ async function runPromptStreamed(input: {
     });
 
     for await (const event of streamed.events) {
+      activeThreadId = replaceLocalThreadId(
+        input.threads,
+        input.messagesByThreadId,
+        input.liveThreads,
+        activeThreadId,
+        getThreadId(thread),
+      );
       const kind = classifyStreamEvent(event);
       const text = extractStreamText(event);
 
@@ -2815,11 +3613,30 @@ async function runPromptStreamed(input: {
         throw new Error(text ?? "Codex run failed.");
       }
 
-      if (!text) {
-        continue;
-      }
-
       if (kind === "assistant") {
+        if (!text) {
+          continue;
+        }
+
+        if (isCompletedAgentMessageEvent(event)) {
+          assistantMessage = updateMessage(
+            input.messagesByThreadId,
+            activeThreadId,
+            assistantMessage.id,
+            { content: text },
+          );
+          threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
+            state: "running",
+            lastResult: assistantMessage.content,
+          });
+          sendSse(input.controller, input.encoder, input.secureSession, {
+            type: "thread.message.created",
+            thread: threadSummary,
+            message: assistantMessage,
+          });
+          continue;
+        }
+
         const assistantPatch = appendMessageDelta(
           input.messagesByThreadId,
           activeThreadId,
@@ -2840,14 +3657,27 @@ async function runPromptStreamed(input: {
           });
         }
       } else {
-        const structured = structuredStreamMessage(kind, event, text);
-        const statusMessage = appendMessage(input.messagesByThreadId, activeThreadId, {
+        if (!text && !isRenderableStructuredStreamEvent(event)) {
+          continue;
+        }
+
+        const structured = structuredStreamMessage(kind, event, text ?? "Codex activity");
+        const itemId = firstString(eventItem(event), ["id"]);
+        const existingMessage = itemId
+          ? input.messagesByThreadId.get(activeThreadId)?.find((message) => message.id === itemId)
+          : undefined;
+        const message = {
           role: kind,
           kind: structured.kind,
           content: structured.content,
           details: structured.details,
-          state: "completed",
-        });
+          state: streamItemState(event),
+        } as const;
+        const statusMessage = existingMessage
+          ? updateMessage(input.messagesByThreadId, activeThreadId, existingMessage.id, message)
+          : itemId
+            ? appendMessageWithId(input.messagesByThreadId, activeThreadId, itemId, message)
+            : appendMessage(input.messagesByThreadId, activeThreadId, message);
         threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
           state: "running",
         });
@@ -2904,8 +3734,6 @@ async function runPromptStreamed(input: {
       thread: threadSummary,
       error: errorBody.error,
     });
-  } finally {
-    closeSseController(input.controller);
   }
 }
 
@@ -2917,6 +3745,7 @@ async function startAppServerTurn(
   const runtime = resolveAppServerRuntime(input.runOptions, input.workspacePath);
   const params: AppServerTurnStartParams = {
     approvalPolicy: runtime.approvalPolicy,
+    clientUserMessageId: input.id,
     collaborationMode: appServerCollaborationMode(input.runOptions),
     cwd: input.workspacePath,
     effort: input.runOptions.reasoningEffort ?? null,
@@ -2945,6 +3774,11 @@ async function resumeAppServerThreadIfNeeded(
   input: QueuedThreadInput,
   runtime: ReturnType<typeof resolveAppServerRuntime>,
 ) {
+  if (appServer.isThreadSubscribed?.(threadId) === false) {
+    await resumeAppServerThread(appServer, threadId, input, runtime);
+    return;
+  }
+
   if (typeof appServer.readThread !== "function") {
     return;
   }
@@ -2973,9 +3807,8 @@ async function resumeAppServerThread(
   await appServer.resumeThread({
     approvalPolicy: runtime.approvalPolicy,
     cwd: input.workspacePath,
-    excludeTurns: false,
+    excludeTurns: true,
     model: input.runOptions.model ?? null,
-    persistExtendedHistory: true,
     sandbox: runtime.sandbox,
     serviceTier: input.runOptions.serviceTier ?? null,
     threadId,
@@ -3049,15 +3882,32 @@ async function streamRunningAppServerThread(input: {
   messagesByThreadId: Map<string, ChatMessage[]>;
   pendingApprovals: Map<string, PendingApproval>;
   secureSession?: SecureSessionHandle;
+  signal: AbortSignal;
   threadId: string;
   threads: Map<string, ThreadMetadata>;
 }) {
   let activeTurnId: string | undefined;
   let assistantMessageId: string | undefined;
+  let observedInputRequest = false;
   let observedTurnActivity = false;
+  let producedTurnOutput = false;
+  const asyncAgentMessageIds = new Set<string>();
   let threadSummary = input.threads.get(input.threadId);
+  let cleanupNotificationHandler = (): void => undefined;
+  let cleanupRequestHandler = (): void => undefined;
+  let handlersCleaned = false;
+  let streamFinished = false;
 
-  const cleanupRequestHandler = input.appServer.onRequest((request) => {
+  const cleanupHandlers = () => {
+    if (handlersCleaned) {
+      return;
+    }
+    handlersCleaned = true;
+    cleanupRequestHandler();
+    cleanupNotificationHandler();
+  };
+
+  cleanupRequestHandler = input.appServer.onRequest((request) => {
     if (!isApprovalServerRequest(request.method)) {
       void input.appServer.rejectRequest(
         request.id,
@@ -3073,9 +3923,12 @@ async function streamRunningAppServerThread(input: {
       return;
     }
 
+    observedInputRequest = true;
+
     if (approval.kind === "structuredUserInput") {
       const pending = {
         appServer: input.appServer,
+        isBlocking: approval.isBlocking,
         kind: approval.kind,
         method: request.method,
         questions: approval.questions,
@@ -3121,8 +3974,21 @@ async function streamRunningAppServerThread(input: {
     });
   });
 
-  let cleanupNotificationHandler = (): void => undefined;
   const completed = new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      streamFinished = true;
+      cleanupHandlers();
+      if (error === undefined) {
+        resolve();
+      } else {
+        reject(error);
+      }
+    };
     cleanupNotificationHandler = input.appServer.onNotification((notification) => {
       const params = recordParams(notification);
       const notificationThreadId = firstString(params, ["threadId"]);
@@ -3132,6 +3998,26 @@ async function streamRunningAppServerThread(input: {
 
       try {
         switch (notification.method) {
+          case "serverRequest/resolved": {
+            const requestId = appServerRequestIdFromParams(params);
+            if (requestId === undefined) {
+              return;
+            }
+            const approvalId = appServerApprovalId(input.threadId, requestId);
+            const pending = input.pendingApprovals.get(approvalId);
+            if (!pending || pending.threadId !== input.threadId) {
+              return;
+            }
+            input.pendingApprovals.delete(approvalId);
+            if (pending.kind === "structuredUserInput") {
+              sendSse(input.controller, input.encoder, input.secureSession, {
+                type: "thread.input_request.resolved",
+                requestId: approvalId,
+                threadId: input.threadId,
+              });
+            }
+            return;
+          }
           case "thread/status/changed": {
             const state = mapAppServerThreadState(params?.status);
             if (state !== "running" && observedTurnActivity) {
@@ -3145,9 +4031,26 @@ async function streamRunningAppServerThread(input: {
               thread: threadSummary,
             });
             if (state !== "running") {
-              cleanupNotificationHandler();
-              resolve();
+              finish();
             }
+            return;
+          }
+          case "thread/goal/updated":
+          case "thread/goal/cleared": {
+            const goal =
+              notification.method === "thread/goal/updated"
+                ? mapAppServerThreadGoal(appServerThreadGoalFromParams(params))
+                : null;
+            const currentThreadSummary = threadSummary ?? input.threads.get(input.threadId);
+            if (!currentThreadSummary) {
+              return;
+            }
+            threadSummary = rememberThreadGoal(input.threads, currentThreadSummary, goal);
+            sendSse(input.controller, input.encoder, input.secureSession, {
+              type: "thread.goal.updated",
+              thread: threadSummary,
+              goal,
+            });
             return;
           }
           case "turn/started":
@@ -3161,7 +4064,7 @@ async function streamRunningAppServerThread(input: {
             if (!item || typeof item !== "object") {
               return;
             }
-            const message = upsertAppServerItemMessage(
+            let message = upsertAppServerItemMessage(
               input.messagesByThreadId,
               input.threadId,
               firstString(params, ["turnId"]) ?? activeTurnId,
@@ -3170,12 +4073,26 @@ async function streamRunningAppServerThread(input: {
             if (!message) {
               return;
             }
-            if (message.role === "assistant") {
+            if (notification.method === "item/started") {
+              message = updateMessage(input.messagesByThreadId, input.threadId, message.id, {
+                state: "streaming",
+              });
+            }
+            const isAsyncAgentMessage = isAsyncAppServerAgentMessage(item as AppServerThreadItem);
+            if (isAsyncAgentMessage) {
+              asyncAgentMessageIds.add(message.id);
+            }
+            if (message.role !== "user" && !isAsyncAgentMessage) {
+              producedTurnOutput = true;
+            }
+            if (message.role === "assistant" && !isAsyncAgentMessage) {
               assistantMessageId = message.id;
             }
             threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
               state: "running",
-              lastResult: message.role === "assistant" ? message.content : undefined,
+              ...(message.role === "assistant" && !isAsyncAgentMessage
+                ? { lastResult: message.content }
+                : {}),
             });
             sendSse(input.controller, input.encoder, input.secureSession, {
               type:
@@ -3190,19 +4107,39 @@ async function streamRunningAppServerThread(input: {
           case "item/agentMessage/delta": {
             observedTurnActivity = true;
             const itemId = firstString(params, ["itemId"]);
-            const delta = firstString(params, ["delta"]);
+            const delta = streamDelta(params);
             if (!itemId || !delta) {
               return;
             }
             if (!input.messagesByThreadId.get(input.threadId)?.some((item) => item.id === itemId)) {
-              appendMessageWithId(input.messagesByThreadId, input.threadId, itemId, {
-                role: "assistant",
-                content: "",
-                state: "streaming",
-                turnId: firstString(params, ["turnId"]) ?? activeTurnId,
+              const createdMessage = appendMessageWithId(
+                input.messagesByThreadId,
+                input.threadId,
+                itemId,
+                {
+                  role: "assistant",
+                  content: "",
+                  state: "streaming",
+                  turnId: firstString(params, ["turnId"]) ?? activeTurnId,
+                },
+              );
+              threadSummary = updateThread(
+                input.threads,
+                input.messagesByThreadId,
+                input.threadId,
+                { state: "running" },
+              );
+              sendSse(input.controller, input.encoder, input.secureSession, {
+                type: "thread.message.created",
+                thread: threadSummary,
+                message: createdMessage,
               });
             }
-            assistantMessageId = itemId;
+            const isAsyncAgentMessage = asyncAgentMessageIds.has(itemId);
+            if (!isAsyncAgentMessage) {
+              assistantMessageId = itemId;
+              producedTurnOutput = true;
+            }
             const patch = appendMessageDelta(
               input.messagesByThreadId,
               input.threadId,
@@ -3212,7 +4149,7 @@ async function streamRunningAppServerThread(input: {
             const message = patch.message;
             updateThread(input.threads, input.messagesByThreadId, input.threadId, {
               state: "running",
-              lastResult: message.content,
+              ...(isAsyncAgentMessage ? {} : { lastResult: message.content }),
             });
             if (patch.delta) {
               sendSse(input.controller, input.encoder, input.secureSession, {
@@ -3226,6 +4163,7 @@ async function streamRunningAppServerThread(input: {
           }
           case "turn/plan/updated": {
             observedTurnActivity = true;
+            producedTurnOutput = true;
             const content = planContentFromRecord(params);
             const message = appendMessage(input.messagesByThreadId, input.threadId, {
               role: "status",
@@ -3251,13 +4189,75 @@ async function streamRunningAppServerThread(input: {
           case "turn/failed": {
             observedTurnActivity = true;
             const state = terminalTurnState(notification.method, params);
+            const terminalTurn = appServerTurnFromParams(params);
+            if (terminalTurn) {
+              activeTurnId = terminalTurn.id;
+              for (const item of terminalTurn.items) {
+                const message = upsertAppServerItemMessage(
+                  input.messagesByThreadId,
+                  input.threadId,
+                  terminalTurn.id,
+                  item,
+                );
+                if (!message) {
+                  continue;
+                }
+                const isAsyncAgentMessage = isAsyncAppServerAgentMessage(item);
+                if (isAsyncAgentMessage) {
+                  asyncAgentMessageIds.add(message.id);
+                }
+                if (message.role !== "user" && !isAsyncAgentMessage) {
+                  producedTurnOutput = true;
+                }
+                if (message.role === "assistant" && !isAsyncAgentMessage) {
+                  assistantMessageId = message.id;
+                }
+                threadSummary = updateThread(
+                  input.threads,
+                  input.messagesByThreadId,
+                  input.threadId,
+                  {
+                    state: "running",
+                    ...(message.role === "assistant" && !isAsyncAgentMessage
+                      ? { lastResult: message.content }
+                      : {}),
+                  },
+                );
+                sendSse(input.controller, input.encoder, input.secureSession, {
+                  type:
+                    message.role === "assistant"
+                      ? "thread.message.completed"
+                      : "thread.message.created",
+                  thread: threadSummary,
+                  message,
+                });
+              }
+            }
             relayDebugLog("app_server.turn.terminal", {
               method: notification.method,
               state,
               threadId: input.threadId,
               turnId: firstString(params, ["turnId"]) ?? activeTurnId,
             });
-            if (assistantMessageId) {
+            if (state === "completed" && !producedTurnOutput && !observedInputRequest) {
+              sendEmptyAppServerTurnError({
+                activeTurnId,
+                controller: input.controller,
+                encoder: input.encoder,
+                messagesByThreadId: input.messagesByThreadId,
+                secureSession: input.secureSession,
+                threadId: input.threadId,
+                threads: input.threads,
+              });
+              finish();
+              return;
+            }
+            const assistantMessage = assistantMessageId
+              ? input.messagesByThreadId
+                  .get(input.threadId)
+                  ?.find((message) => message.id === assistantMessageId)
+              : undefined;
+            if (assistantMessageId && assistantMessage?.state !== "completed") {
               const completedMessage = updateMessage(
                 input.messagesByThreadId,
                 input.threadId,
@@ -3279,31 +4279,64 @@ async function streamRunningAppServerThread(input: {
               thread: threadSummary,
             });
             if (state === "failed") {
+              const errorBody = apiError(
+                "codex_run_failed",
+                threadSummary.lastError ?? "Codex turn did not complete.",
+              );
+              const message = appendMessage(input.messagesByThreadId, input.threadId, {
+                role: "error",
+                content: errorBody.error.message,
+                state: "failed",
+                turnId: activeTurnId,
+              });
+              sendSse(input.controller, input.encoder, input.secureSession, {
+                type: "thread.message.created",
+                thread: threadSummary,
+                message,
+              });
               sendSse(input.controller, input.encoder, input.secureSession, {
                 type: "thread.error",
                 thread: threadSummary,
-                error: apiError(
-                  "codex_run_failed",
-                  threadSummary.lastError ?? "Codex turn did not complete.",
-                ).error,
+                error: errorBody.error,
               });
             }
-            cleanupNotificationHandler();
-            resolve();
+            finish();
             return;
           }
         }
       } catch (error) {
-        cleanupNotificationHandler();
-        reject(error);
+        finish(error);
       }
     });
   });
+  let removeAbortListener = () => {};
+  const aborted = new Promise<void>((resolve) => {
+    const onAbort = () => {
+      cleanupHandlers();
+      resolve();
+    };
+    if (input.signal.aborted) {
+      onAbort();
+      return;
+    }
+    input.signal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => input.signal.removeEventListener("abort", onAbort);
+  });
 
   try {
-    const appServerThread = await input.appServer.readThread(input.threadId, {
-      includeTurns: false,
-    });
+    const appServerThread = await Promise.race([
+      typeof input.appServer.resumeThread === "function"
+        ? input.appServer.resumeThread({ excludeTurns: true, threadId: input.threadId })
+        : input.appServer.readThread(input.threadId, { includeTurns: false }),
+      aborted.then(() => undefined),
+    ]);
+    if (!appServerThread || input.signal.aborted) {
+      return;
+    }
+    if (streamFinished) {
+      await completed;
+      return;
+    }
     threadSummary = rememberAppServerThread(input.threads, appServerThread);
     sendSse(input.controller, input.encoder, input.secureSession, {
       type: "thread.state.changed",
@@ -3312,8 +4345,11 @@ async function streamRunningAppServerThread(input: {
     if (threadSummary.state !== "running") {
       return;
     }
-    await completed;
+    await Promise.race([completed, aborted]);
   } catch (error) {
+    if (input.signal.aborted) {
+      return;
+    }
     threadSummary = updateThread(input.threads, input.messagesByThreadId, input.threadId, {
       state: "failed",
       lastError: errorMessage(error),
@@ -3324,9 +4360,8 @@ async function streamRunningAppServerThread(input: {
       error: apiError("codex_run_failed", threadSummary.lastError ?? "Codex run failed.").error,
     });
   } finally {
-    cleanupRequestHandler();
-    cleanupNotificationHandler();
-    closeSseController(input.controller);
+    removeAbortListener();
+    cleanupHandlers();
   }
 }
 
@@ -3339,6 +4374,8 @@ async function runAppServerPromptStreamed(input: {
   messagesByThreadId: Map<string, ChatMessage[]>;
   pendingApprovals: Map<string, PendingApproval>;
   queuedInputsByThreadId: Map<string, QueuedThreadInput[]>;
+  runAppServerMutation: <T>(threadId: string, operation: () => Promise<T>) => Promise<T>;
+  runThreadOperation: <T>(threadId: string, operation: () => Promise<T>) => Promise<T>;
   prompt: string;
   runOptions: {
     model?: string;
@@ -3366,7 +4403,9 @@ async function runAppServerPromptStreamed(input: {
   );
   const prompt = input.prompt;
   let handedOffToQueuedTurn = false;
+  let observedInputRequest = false;
   let producedTurnOutput = false;
+  const asyncAgentMessageIds = new Set<string>();
 
   let userMessage = appendMessage(input.messagesByThreadId, activeThreadId, {
     role: "user",
@@ -3407,9 +4446,12 @@ async function runAppServerPromptStreamed(input: {
       return;
     }
 
+    observedInputRequest = true;
+
     if (approval.kind === "structuredUserInput") {
       const pending = {
         appServer: input.appServer,
+        isBlocking: approval.isBlocking,
         kind: approval.kind,
         method: request.method,
         questions: approval.questions,
@@ -3456,7 +4498,247 @@ async function runAppServerPromptStreamed(input: {
   });
 
   let cleanupNotificationHandler = (): void => undefined;
+  let resolveCompleted = (): void => undefined;
+  let rejectCompleted = (_error: unknown): void => undefined;
+  const finalizedTurnIds = new Set<string>();
+
+  function resetTurnTracking() {
+    activeTurnId = undefined;
+    assistantMessageId = undefined;
+    observedInputRequest = false;
+    producedTurnOutput = false;
+  }
+
+  async function finishTerminalTurn(options: {
+    lastError?: string;
+    method: string;
+    state: "completed" | "failed";
+    turnId?: string;
+  }) {
+    const terminalTurnId = options.turnId ?? activeTurnId;
+    if (terminalTurnId && finalizedTurnIds.has(terminalTurnId)) {
+      return;
+    }
+    if (terminalTurnId) {
+      finalizedTurnIds.add(terminalTurnId);
+      activeTurnId = terminalTurnId;
+    }
+
+    relayDebugLog("app_server.turn.terminal", {
+      method: options.method,
+      state: options.state,
+      threadId: activeThreadId,
+      turnId: terminalTurnId,
+    });
+    input.activeAppServerTurnIdsByThreadId.delete(activeThreadId);
+
+    const hasQueuedInput = (input.queuedInputsByThreadId.get(activeThreadId)?.length ?? 0) > 0;
+    if (
+      options.state === "completed" &&
+      !producedTurnOutput &&
+      !observedInputRequest &&
+      !hasQueuedInput
+    ) {
+      sendEmptyAppServerTurnError({
+        activeTurnId: terminalTurnId,
+        controller: input.controller,
+        encoder: input.encoder,
+        messagesByThreadId: input.messagesByThreadId,
+        secureSession: input.secureSession,
+        threadId: activeThreadId,
+        threads: input.threads,
+      });
+      input.steeringThreads.delete(activeThreadId);
+      cleanupNotificationHandler();
+      resolveCompleted();
+      return;
+    }
+
+    const assistantMessage = assistantMessageId
+      ? input.messagesByThreadId
+          .get(activeThreadId)
+          ?.find((message) => message.id === assistantMessageId)
+      : undefined;
+    if (assistantMessageId && assistantMessage?.state !== "completed") {
+      const completedMessage = updateMessage(
+        input.messagesByThreadId,
+        activeThreadId,
+        assistantMessageId,
+        { state: "completed" },
+      );
+      sendSse(input.controller, input.encoder, input.secureSession, {
+        type: "thread.message.completed",
+        thread: threadSummary,
+        message: completedMessage,
+      });
+    }
+
+    const nextQueuedInput =
+      options.state === "completed"
+        ? shiftQueuedInput(input.queuedInputsByThreadId, activeThreadId)
+        : undefined;
+    threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
+      state: nextQueuedInput ? "running" : options.state,
+      lastError: nextQueuedInput ? undefined : options.lastError,
+      ...(nextQueuedInput
+        ? {
+            lastPrompt: promptWithAttachmentReferences(
+              nextQueuedInput.prompt,
+              nextQueuedInput.attachments,
+            ),
+            ...runtimeMetadataFromOptions(nextQueuedInput.runOptions),
+          }
+        : {}),
+    });
+    sendSse(input.controller, input.encoder, input.secureSession, {
+      type: "thread.state.changed",
+      thread: threadSummary,
+    });
+
+    if (options.state === "failed") {
+      const errorBody = apiError(
+        "codex_run_failed",
+        options.lastError ?? "Codex turn did not complete.",
+      );
+      const message = appendMessage(input.messagesByThreadId, activeThreadId, {
+        role: "error",
+        content: errorBody.error.message,
+        state: "failed",
+        turnId: terminalTurnId,
+      });
+      sendSse(input.controller, input.encoder, input.secureSession, {
+        type: "thread.message.created",
+        thread: threadSummary,
+        message,
+      });
+      sendSse(input.controller, input.encoder, input.secureSession, {
+        type: "thread.error",
+        thread: threadSummary,
+        error: errorBody.error,
+      });
+      input.steeringThreads.delete(activeThreadId);
+      cleanupNotificationHandler();
+      resolveCompleted();
+      return;
+    }
+
+    if (nextQueuedInput) {
+      handedOffToQueuedTurn = true;
+      resetTurnTracking();
+      input.steeringThreads.add(activeThreadId);
+      const nextTurn = await startAppServerTurn(input.appServer, activeThreadId, nextQueuedInput);
+      await processReturnedTurn(nextTurn);
+      return;
+    }
+
+    input.steeringThreads.delete(activeThreadId);
+    cleanupNotificationHandler();
+    resolveCompleted();
+  }
+
+  function processTurnItems(turn: AppServerTurn) {
+    activeTurnId = turn.id;
+    input.activeAppServerTurnIdsByThreadId.set(activeThreadId, turn.id);
+    const turnIsRunning = isAppServerTurnRunning(turn);
+
+    for (const item of turn.items) {
+      const previousUserMessage = userMessage;
+      const canonicalUserMessage = replaceDuplicateInitialUserMessage(
+        input.messagesByThreadId,
+        activeThreadId,
+        turn.id,
+        item,
+        userMessage.id,
+        displayPrompt,
+      );
+      if (canonicalUserMessage) {
+        userMessage = canonicalUserMessage;
+        if (
+          canonicalUserMessage.id !== previousUserMessage.id ||
+          canonicalUserMessage.turnId !== previousUserMessage.turnId
+        ) {
+          relayDebugLog("app_server.user_message.canonicalized", {
+            messageId: canonicalUserMessage.id,
+            previousMessageId: previousUserMessage.id,
+            threadId: activeThreadId,
+            turnId: canonicalUserMessage.turnId,
+          });
+          sendSse(input.controller, input.encoder, input.secureSession, {
+            type: "thread.message.created",
+            thread: threadSummary,
+            message: canonicalUserMessage,
+          });
+        }
+        continue;
+      }
+      const message = upsertAppServerItemMessage(
+        input.messagesByThreadId,
+        activeThreadId,
+        turn.id,
+        item,
+      );
+      if (!message) {
+        continue;
+      }
+      const isAsyncAgentMessage = isAsyncAppServerAgentMessage(item);
+      if (isAsyncAgentMessage) {
+        asyncAgentMessageIds.add(message.id);
+      }
+      if (message.role !== "user" && !isAsyncAgentMessage) {
+        producedTurnOutput = true;
+      }
+      if (message.role === "assistant" && !isAsyncAgentMessage) {
+        assistantMessageId = message.id;
+      }
+      threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
+        state: "running",
+        ...(message.role === "assistant" && !isAsyncAgentMessage
+          ? { lastResult: message.content }
+          : {}),
+      });
+      sendSse(input.controller, input.encoder, input.secureSession, {
+        type: message.role === "assistant" ? "thread.message.completed" : "thread.message.created",
+        thread: threadSummary,
+        message,
+      });
+    }
+
+    return turnIsRunning;
+  }
+
+  async function processReturnedTurn(turn: AppServerTurn) {
+    if (finalizedTurnIds.has(turn.id)) {
+      return;
+    }
+    const turnIsRunning = processTurnItems(turn);
+
+    if (turnIsRunning) {
+      return;
+    }
+    const params = { turn };
+    const state = terminalTurnState("turn/completed", params);
+    await finishTerminalTurn({
+      lastError: state === "failed" ? turnErrorMessage(params) : undefined,
+      method: "turn/returned",
+      state,
+      turnId: turn.id,
+    });
+  }
+
+  function startAndProcessAppServerTurn(
+    threadId: string,
+    queuedInput: QueuedThreadInput,
+  ): Promise<AppServerTurn> {
+    return input.runAppServerMutation(threadId, async () => {
+      const turn = await startAppServerTurn(input.appServer, threadId, queuedInput);
+      await processReturnedTurn(turn);
+      return turn;
+    });
+  }
+
   const completed = new Promise<void>((resolve, reject) => {
+    resolveCompleted = resolve;
+    rejectCompleted = reject;
     cleanupNotificationHandler = input.appServer.onNotification((notification) => {
       const params = recordParams(notification);
       const threadId = firstString(params, ["threadId"]);
@@ -3466,6 +4748,26 @@ async function runAppServerPromptStreamed(input: {
 
       try {
         switch (notification.method) {
+          case "serverRequest/resolved": {
+            const requestId = appServerRequestIdFromParams(params);
+            if (requestId === undefined) {
+              return;
+            }
+            const approvalId = appServerApprovalId(activeThreadId, requestId);
+            const pending = input.pendingApprovals.get(approvalId);
+            if (!pending || pending.threadId !== activeThreadId) {
+              return;
+            }
+            input.pendingApprovals.delete(approvalId);
+            if (pending.kind === "structuredUserInput") {
+              sendSse(input.controller, input.encoder, input.secureSession, {
+                type: "thread.input_request.resolved",
+                requestId: approvalId,
+                threadId: activeThreadId,
+              });
+            }
+            return;
+          }
           case "thread/status/changed": {
             const status = params?.status;
             const state = mapAppServerThreadState(status);
@@ -3481,6 +4783,20 @@ async function runAppServerPromptStreamed(input: {
             });
             return;
           }
+          case "thread/goal/updated":
+          case "thread/goal/cleared": {
+            const goal =
+              notification.method === "thread/goal/updated"
+                ? mapAppServerThreadGoal(appServerThreadGoalFromParams(params))
+                : null;
+            threadSummary = rememberThreadGoal(input.threads, threadSummary, goal);
+            sendSse(input.controller, input.encoder, input.secureSession, {
+              type: "thread.goal.updated",
+              thread: threadSummary,
+              goal,
+            });
+            return;
+          }
           case "turn/started":
             activeTurnId = firstString(params, ["turnId"]) ?? turnIdFromParams(params);
             if (activeTurnId) {
@@ -3493,6 +4809,7 @@ async function runAppServerPromptStreamed(input: {
             if (!item || typeof item !== "object") {
               return;
             }
+            const previousUserMessage = userMessage;
             const canonicalUserMessage = replaceDuplicateInitialUserMessage(
               input.messagesByThreadId,
               activeThreadId,
@@ -3503,10 +4820,26 @@ async function runAppServerPromptStreamed(input: {
             );
             if (canonicalUserMessage) {
               userMessage = canonicalUserMessage;
+              if (
+                canonicalUserMessage.id !== previousUserMessage.id ||
+                canonicalUserMessage.turnId !== previousUserMessage.turnId
+              ) {
+                relayDebugLog("app_server.user_message.canonicalized", {
+                  messageId: canonicalUserMessage.id,
+                  previousMessageId: previousUserMessage.id,
+                  threadId: activeThreadId,
+                  turnId: canonicalUserMessage.turnId,
+                });
+                sendSse(input.controller, input.encoder, input.secureSession, {
+                  type: "thread.message.created",
+                  thread: threadSummary,
+                  message: canonicalUserMessage,
+                });
+              }
               return;
             }
             const turnId = firstString(params, ["turnId"]) ?? activeTurnId;
-            const message = upsertAppServerItemMessage(
+            let message = upsertAppServerItemMessage(
               input.messagesByThreadId,
               activeThreadId,
               turnId,
@@ -3515,13 +4848,26 @@ async function runAppServerPromptStreamed(input: {
             if (!message) {
               return;
             }
-            producedTurnOutput = true;
-            if (message.role === "assistant") {
+            if (notification.method === "item/started") {
+              message = updateMessage(input.messagesByThreadId, activeThreadId, message.id, {
+                state: "streaming",
+              });
+            }
+            const isAsyncAgentMessage = isAsyncAppServerAgentMessage(item as AppServerThreadItem);
+            if (isAsyncAgentMessage) {
+              asyncAgentMessageIds.add(message.id);
+            }
+            if (message.role !== "user" && !isAsyncAgentMessage) {
+              producedTurnOutput = true;
+            }
+            if (message.role === "assistant" && !isAsyncAgentMessage) {
               assistantMessageId = message.id;
             }
             threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
               state: "running",
-              lastResult: message.role === "assistant" ? message.content : undefined,
+              ...(message.role === "assistant" && !isAsyncAgentMessage
+                ? { lastResult: message.content }
+                : {}),
             });
             sendSse(input.controller, input.encoder, input.secureSession, {
               type:
@@ -3535,19 +4881,38 @@ async function runAppServerPromptStreamed(input: {
           }
           case "item/agentMessage/delta": {
             const itemId = firstString(params, ["itemId"]);
-            const delta = firstString(params, ["delta"]);
+            const delta = streamDelta(params);
             if (!itemId || !delta) {
               return;
             }
             if (!input.messagesByThreadId.get(activeThreadId)?.some((item) => item.id === itemId)) {
-              appendMessageWithId(input.messagesByThreadId, activeThreadId, itemId, {
-                role: "assistant",
-                content: "",
-                state: "streaming",
-                turnId: firstString(params, ["turnId"]) ?? activeTurnId,
+              const createdMessage = appendMessageWithId(
+                input.messagesByThreadId,
+                activeThreadId,
+                itemId,
+                {
+                  role: "assistant",
+                  content: "",
+                  state: "streaming",
+                  turnId: firstString(params, ["turnId"]) ?? activeTurnId,
+                },
+              );
+              threadSummary = updateThread(
+                input.threads,
+                input.messagesByThreadId,
+                activeThreadId,
+                { state: "running" },
+              );
+              sendSse(input.controller, input.encoder, input.secureSession, {
+                type: "thread.message.created",
+                thread: threadSummary,
+                message: createdMessage,
               });
             }
-            assistantMessageId = itemId;
+            const isAsyncAgentMessage = asyncAgentMessageIds.has(itemId);
+            if (!isAsyncAgentMessage) {
+              assistantMessageId = itemId;
+            }
             const patch = appendMessageDelta(
               input.messagesByThreadId,
               activeThreadId,
@@ -3555,10 +4920,12 @@ async function runAppServerPromptStreamed(input: {
               delta,
             );
             const message = patch.message;
-            producedTurnOutput = true;
+            if (!isAsyncAgentMessage) {
+              producedTurnOutput = true;
+            }
             updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
               state: "running",
-              lastResult: message.content,
+              ...(isAsyncAgentMessage ? {} : { lastResult: message.content }),
             });
             if (patch.delta) {
               sendSse(input.controller, input.encoder, input.secureSession, {
@@ -3596,87 +4963,33 @@ async function runAppServerPromptStreamed(input: {
           case "turn/completed":
           case "turn/failed": {
             const state = terminalTurnState(notification.method, params);
-            relayDebugLog("app_server.turn.terminal", {
-              method: notification.method,
-              state,
-              threadId: activeThreadId,
-              turnId: firstString(params, ["turnId"]) ?? activeTurnId,
-            });
-            input.activeAppServerTurnIdsByThreadId.delete(activeThreadId);
-            if (assistantMessageId) {
-              const completedMessage = updateMessage(
-                input.messagesByThreadId,
-                activeThreadId,
-                assistantMessageId,
-                { state: "completed" },
-              );
-              sendSse(input.controller, input.encoder, input.secureSession, {
-                type: "thread.message.completed",
-                thread: threadSummary,
-                message: completedMessage,
-              });
-            }
-            const lastError = state === "failed" ? turnErrorMessage(params) : undefined;
-            const nextQueuedInput =
-              state === "completed"
-                ? shiftQueuedInput(input.queuedInputsByThreadId, activeThreadId)
-                : undefined;
-            threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
-              state: nextQueuedInput ? "running" : state,
-              lastError: nextQueuedInput ? undefined : lastError,
-              ...(nextQueuedInput
-                ? {
-                    lastPrompt: promptWithAttachmentReferences(
-                      nextQueuedInput.prompt,
-                      nextQueuedInput.attachments,
-                    ),
-                    ...runtimeMetadataFromOptions(nextQueuedInput.runOptions),
+            const terminalTurn = appServerTurnFromParams(params);
+            const terminalTurnId =
+              firstString(params, ["turnId"]) ?? turnIdFromParams(params) ?? activeTurnId;
+            void input
+              .runThreadOperation(activeThreadId, async () => {
+                await input.runAppServerMutation(activeThreadId, async () => {
+                  if (
+                    (terminalTurnId && finalizedTurnIds.has(terminalTurnId)) ||
+                    (terminalTurnId && activeTurnId && terminalTurnId !== activeTurnId)
+                  ) {
+                    return;
                   }
-                : {}),
-            });
-            sendSse(input.controller, input.encoder, input.secureSession, {
-              type: "thread.state.changed",
-              thread: threadSummary,
-            });
-            if (state === "failed") {
-              const errorBody = apiError(
-                "codex_run_failed",
-                lastError ?? "Codex turn did not complete.",
-              );
-              appendMessage(input.messagesByThreadId, activeThreadId, {
-                role: "error",
-                content: errorBody.error.message,
-                state: "failed",
-                turnId: activeTurnId,
-              });
-              sendSse(input.controller, input.encoder, input.secureSession, {
-                type: "thread.error",
-                thread: threadSummary,
-                error: errorBody.error,
-              });
-              input.steeringThreads.delete(activeThreadId);
-              cleanupNotificationHandler();
-              resolve();
-              return;
-            }
-            if (nextQueuedInput) {
-              handedOffToQueuedTurn = true;
-              assistantMessageId = undefined;
-              input.steeringThreads.add(activeThreadId);
-              void startAppServerTurn(input.appServer, activeThreadId, nextQueuedInput)
-                .then((turn) => {
-                  activeTurnId = turn.id;
-                  input.activeAppServerTurnIdsByThreadId.set(activeThreadId, activeTurnId);
-                })
-                .catch((error: unknown) => {
-                  cleanupNotificationHandler();
-                  reject(error);
+                  if (terminalTurn && terminalTurn.id === terminalTurnId) {
+                    processTurnItems(terminalTurn);
+                  }
+                  await finishTerminalTurn({
+                    lastError: state === "failed" ? turnErrorMessage(params) : undefined,
+                    method: notification.method,
+                    state,
+                    turnId: terminalTurnId,
+                  });
                 });
-              return;
-            }
-            input.steeringThreads.delete(activeThreadId);
-            cleanupNotificationHandler();
-            resolve();
+              })
+              .catch((error: unknown) => {
+                cleanupNotificationHandler();
+                rejectCompleted(error);
+              });
             return;
           }
         }
@@ -3695,42 +5008,40 @@ async function runAppServerPromptStreamed(input: {
       `wait idle gate first=${isFirstLocalMessage ? "1" : "0"} active=${activeTurnId ?? "none"}`,
       activeThreadId,
     );
-    if (activeTurnId) {
-      debugStream("wait idle begin", activeThreadId);
-      await waitForAppServerThreadIdle({
-        appServer: input.appServer,
-        onWaiting() {
-          if (waitingForActiveTurnMessageId) {
-            return;
-          }
-          const message = appendMessage(input.messagesByThreadId, activeThreadId, {
-            role: "status",
-            content: "Waiting for the current Codex turn to finish.",
-            state: "streaming",
-          });
-          waitingForActiveTurnMessageId = message.id;
-          threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
-            state: "running",
-          });
-          sendSse(input.controller, input.encoder, input.secureSession, {
-            type: "thread.message.created",
-            thread: threadSummary,
-            message,
-          });
-        },
-        onWaitingHeartbeat() {
-          threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
-            state: "running",
-          });
-          sendSse(input.controller, input.encoder, input.secureSession, {
-            type: "thread.state.changed",
-            thread: threadSummary,
-          });
-        },
-        threadId: activeThreadId,
-      });
-      debugStream("wait idle complete", activeThreadId);
-    }
+    debugStream("wait idle begin", activeThreadId);
+    await waitForAppServerThreadIdle({
+      appServer: input.appServer,
+      onWaiting() {
+        if (waitingForActiveTurnMessageId) {
+          return;
+        }
+        const message = appendMessage(input.messagesByThreadId, activeThreadId, {
+          role: "status",
+          content: "Waiting for the current Codex turn to finish.",
+          state: "streaming",
+        });
+        waitingForActiveTurnMessageId = message.id;
+        threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
+          state: "running",
+        });
+        sendSse(input.controller, input.encoder, input.secureSession, {
+          type: "thread.message.created",
+          thread: threadSummary,
+          message,
+        });
+      },
+      onWaitingHeartbeat() {
+        threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
+          state: "running",
+        });
+        sendSse(input.controller, input.encoder, input.secureSession, {
+          type: "thread.state.changed",
+          thread: threadSummary,
+        });
+      },
+      threadId: activeThreadId,
+    });
+    debugStream("wait idle complete", activeThreadId);
     if (waitingForActiveTurnMessageId) {
       const message = updateMessage(
         input.messagesByThreadId,
@@ -3750,9 +5061,9 @@ async function runAppServerPromptStreamed(input: {
     debugStream("start turn begin", activeThreadId);
     let turn: AppServerTurn;
     try {
-      turn = await startAppServerTurn(input.appServer, activeThreadId, {
+      turn = await startAndProcessAppServerTurn(activeThreadId, {
         attachments: input.attachments,
-        id: randomUUID(),
+        id: userMessage.id,
         prompt,
         runOptions: input.runOptions,
         skills: input.skills,
@@ -3791,83 +5102,16 @@ async function runAppServerPromptStreamed(input: {
         thread: threadSummary,
         message: userMessage,
       });
-      turn = await startAppServerTurn(input.appServer, activeThreadId, {
+      turn = await startAndProcessAppServerTurn(activeThreadId, {
         attachments: input.attachments,
-        id: randomUUID(),
+        id: userMessage.id,
         prompt,
         runOptions: input.runOptions,
         skills: input.skills,
         workspacePath: input.workspacePath,
       });
     }
-    activeTurnId = turn.id;
-    input.activeAppServerTurnIdsByThreadId.set(activeThreadId, activeTurnId);
-    debugStream("start turn complete", activeThreadId, activeTurnId);
-    let streamedReturnedItem = false;
-    for (const item of turn.items) {
-      const canonicalUserMessage = replaceDuplicateInitialUserMessage(
-        input.messagesByThreadId,
-        activeThreadId,
-        activeTurnId,
-        item,
-        userMessage.id,
-        displayPrompt,
-      );
-      if (canonicalUserMessage) {
-        userMessage = canonicalUserMessage;
-        continue;
-      }
-      const message = upsertAppServerItemMessage(
-        input.messagesByThreadId,
-        activeThreadId,
-        activeTurnId,
-        item,
-      );
-      if (!message) {
-        continue;
-      }
-      streamedReturnedItem = true;
-      producedTurnOutput = true;
-      if (message.role === "assistant") {
-        assistantMessageId = message.id;
-      }
-      threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
-        state: "running",
-        lastResult: message.role === "assistant" ? message.content : undefined,
-      });
-      sendSse(input.controller, input.encoder, input.secureSession, {
-        type: message.role === "assistant" ? "thread.message.completed" : "thread.message.created",
-        thread: threadSummary,
-        message,
-      });
-    }
-    const returnedState = mapAppServerThreadState(turn.status);
-    if (returnedState !== "running") {
-      if (!streamedReturnedItem && !producedTurnOutput) {
-        sendEmptyAppServerTurnError({
-          activeTurnId,
-          controller: input.controller,
-          encoder: input.encoder,
-          messagesByThreadId: input.messagesByThreadId,
-          secureSession: input.secureSession,
-          threadId: activeThreadId,
-          threads: input.threads,
-        });
-        input.steeringThreads.delete(activeThreadId);
-        cleanupNotificationHandler();
-        return;
-      }
-      threadSummary = updateThread(input.threads, input.messagesByThreadId, activeThreadId, {
-        state: returnedState,
-      });
-      sendSse(input.controller, input.encoder, input.secureSession, {
-        type: "thread.state.changed",
-        thread: threadSummary,
-      });
-      input.steeringThreads.delete(activeThreadId);
-      cleanupNotificationHandler();
-      return;
-    }
+    debugStream("start turn complete", activeThreadId, turn.id);
     await completed;
   } catch (error) {
     debugStream(`failed ${errorMessage(error)}`, activeThreadId, activeTurnId);
@@ -3892,7 +5136,6 @@ async function runAppServerPromptStreamed(input: {
       input.activeAppServerTurnIdsByThreadId.delete(activeThreadId);
       input.steeringThreads.delete(activeThreadId);
     }
-    closeSseController(input.controller);
   }
 }
 
@@ -4027,11 +5270,10 @@ async function recoverMissingAppServerThread(input: {
   const thread = await input.appServer.startThread({
     approvalPolicy: runtime.approvalPolicy,
     cwd: input.workspacePath,
-    experimentalRawEvents: false,
     model: input.runOptions.model ?? null,
-    persistExtendedHistory: true,
     sandbox: runtime.sandbox,
     serviceTier: input.runOptions.serviceTier ?? null,
+    threadSource: "codex-relay",
   });
   const recoveredThread = mapAppServerThread({
     ...thread,
@@ -4184,7 +5426,9 @@ function createSecureSessionHandle(
 }
 
 function sortedThreads(threads: Map<string, ThreadMetadata>) {
-  return [...threads.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return [...threads.values()]
+    .filter((thread) => !isSubagentThread(thread))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 async function ensureKnownThread(input: {
@@ -4195,7 +5439,7 @@ async function ensureKnownThread(input: {
 }) {
   const knownThread = input.threads.get(input.threadId);
   if (knownThread) {
-    return knownThread;
+    return isSubagentThread(knownThread) ? undefined : knownThread;
   }
 
   if (!input.appServer) {
@@ -4206,6 +5450,9 @@ async function ensureKnownThread(input: {
     const appServerThread = await input.appServer.readThread(input.threadId, {
       includeTurns: false,
     });
+    if (isSubagentThread(appServerThread)) {
+      return undefined;
+    }
     const thread = rememberAppServerThread(input.threads, appServerThread);
     return thread;
   } catch {
@@ -4275,9 +5522,12 @@ function upsertAppServerItemMessage(
     return undefined;
   }
 
-  const existing = messagesByThreadId.get(threadId)?.some((candidate) => candidate.id === item.id);
+  const existing = messagesByThreadId.get(threadId)?.find((candidate) => candidate.id === item.id);
   if (existing) {
-    return updateMessage(messagesByThreadId, threadId, item.id, message);
+    return updateMessage(messagesByThreadId, threadId, item.id, {
+      ...message,
+      createdAt: existing.createdAt,
+    });
   }
 
   return appendMessageWithId(messagesByThreadId, threadId, item.id, {
@@ -4324,6 +5574,10 @@ function isDuplicateInitialUserMessage(
     return false;
   }
 
+  if (item.clientId) {
+    return item.clientId === localMessageId;
+  }
+
   const localMessage = messagesByThreadId
     .get(threadId)
     ?.find((message) => message.id === localMessageId);
@@ -4353,7 +5607,7 @@ function appServerUserMessageText(item: Extract<AppServerThreadItem, { type: "us
     .map((content) => {
       switch (content.type) {
         case "text":
-          return content.text;
+          return isCodexInjectedContextBlock(content.text) ? "" : content.text;
         case "image":
         case "localImage":
         case "document":
@@ -4369,11 +5623,37 @@ function appServerUserMessageText(item: Extract<AppServerThreadItem, { type: "us
   return promptMarkdownWithSkills(promptWithAppServerImageReferences(text, item.content), skills);
 }
 
+function isAppServerInjectedContextMessage(item: AppServerThreadItem) {
+  if (item.type !== "userMessage" || !("content" in item) || !Array.isArray(item.content)) {
+    return false;
+  }
+  const content = (item as Extract<AppServerThreadItem, { type: "userMessage" }>).content;
+  return (
+    content.length > 0 &&
+    content.every((input) => input.type === "text" && isCodexInjectedContextBlock(input.text))
+  );
+}
+
+function isCodexInjectedContextBlock(value: string) {
+  const text = value.trim();
+  return (
+    (text.startsWith("<recommended_plugins>") && text.endsWith("</recommended_plugins>")) ||
+    (text.startsWith("# AGENTS.md instructions for ") &&
+      text.includes("\n\n<INSTRUCTIONS>") &&
+      text.endsWith("</INSTRUCTIONS>")) ||
+    (text.startsWith("<environment_context>") && text.endsWith("</environment_context>"))
+  );
+}
+
 function appServerUserMessageDetails(item: Extract<AppServerThreadItem, { type: "userMessage" }>) {
   const attachments: AppServerUserAttachmentDetail[] = item.content.flatMap(
     (content): AppServerUserAttachmentDetail[] => {
       switch (content.type) {
         case "image":
+          // Uploaded images can be referenced by `fileId` only, which has no URL to preview.
+          if (!content.url) {
+            return [];
+          }
           if (content.url.startsWith("data:image/")) {
             const materialized = materializeDataUriImage(content.url);
             return materialized ? [materialized] : [];
@@ -4876,7 +6156,7 @@ function sendSse(
   encoder: TextEncoder,
   secureSession: SecureSessionHandle | undefined,
   event: StreamThreadRunEvent,
-) {
+): boolean {
   const parsed = StreamThreadRunEventSchema.parse(event);
   const threadId = threadIdFromStreamEvent(parsed);
   relayDebugLog("thread.stream.sse", {
@@ -4897,7 +6177,7 @@ function sendSse(
       stage: "event",
       threadId,
     });
-    return;
+    return false;
   }
   if (!enqueueSseChunk(controller, encoder.encode(`data: ${JSON.stringify(data)}\n\n`))) {
     relayDebugLog("thread.stream.sse.enqueue_failed", {
@@ -4905,7 +6185,9 @@ function sendSse(
       stage: "data",
       threadId,
     });
+    return false;
   }
+  return true;
 }
 
 function sendTerminalOutputSse(
@@ -4965,10 +6247,10 @@ function closeSseController(controller: ReadableStreamDefaultController<Uint8Arr
 }
 
 function closeActiveStreamControllers(
-  controllers: Set<ReadableStreamDefaultController<Uint8Array>>,
+  controllers: Map<ReadableStreamDefaultController<Uint8Array>, () => void>,
 ) {
-  for (const controller of controllers) {
-    closeSseController(controller);
+  for (const closeStream of controllers.values()) {
+    closeStream();
   }
   controllers.clear();
 }
@@ -4986,40 +6268,52 @@ function startWebPreviewTargetMonitor({
   send,
 }: {
   bridgeUrl: string;
-  send: (target: WebPreviewTarget) => void;
+  send: (target: WebPreviewTarget) => boolean;
 }) {
   const urls = webPreviewCandidateUrls(bridgeUrl);
-  const seenUrls = new Set<string>();
+  const abortController = new AbortController();
   let stopped = false;
+  let nextScan: ReturnType<typeof setTimeout> | undefined;
+
+  const stop = () => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    abortController.abort();
+    if (nextScan) {
+      clearTimeout(nextScan);
+      nextScan = undefined;
+    }
+  };
 
   async function scan() {
     if (stopped) {
       return;
     }
 
-    const targets = await detectWebPreviewTargets(urls);
-    for (const target of targets) {
-      if (stopped || seenUrls.has(target.url)) {
-        continue;
-      }
-
-      seenUrls.add(target.url);
+    const target = await detectWebPreviewTarget(urls, abortController.signal);
+    if (stopped) {
+      return;
+    }
+    if (target) {
+      stop();
       try {
         send(target);
       } catch {
-        stopped = true;
-        return;
+        // The stream may have closed between detection and delivery.
       }
+      return;
     }
+
+    nextScan = setTimeout(() => {
+      nextScan = undefined;
+      void scan();
+    }, 1500);
   }
 
   void scan();
-  const interval = setInterval(() => void scan(), 1500);
-
-  return () => {
-    stopped = true;
-    clearInterval(interval);
-  };
+  return stop;
 }
 
 function webPreviewCandidateUrls(bridgeUrl: string) {
@@ -5056,13 +6350,22 @@ function readCollaborationModeTemplate(name: (typeof collaborationModeTemplateNa
     .trim();
 }
 
-async function detectWebPreviewTargets(urls: string[]) {
-  const targets = await Promise.all(urls.map((url) => probeWebPreviewTarget(url)));
-  return targets.filter((target): target is WebPreviewTarget => Boolean(target));
+async function detectWebPreviewTarget(urls: string[], signal: AbortSignal) {
+  const targets = await Promise.all(urls.map((url) => probeWebPreviewTarget(url, signal)));
+  return targets.find((target): target is WebPreviewTarget => Boolean(target));
 }
 
-async function probeWebPreviewTarget(url: string): Promise<WebPreviewTarget | undefined> {
+async function probeWebPreviewTarget(
+  url: string,
+  signal: AbortSignal,
+): Promise<WebPreviewTarget | undefined> {
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal.aborted) {
+    abort();
+  } else {
+    signal.addEventListener("abort", abort, { once: true });
+  }
   const timeout = setTimeout(() => controller.abort(), 700);
 
   try {
@@ -5090,6 +6393,7 @@ async function probeWebPreviewTarget(url: string): Promise<WebPreviewTarget | un
     return undefined;
   } finally {
     clearTimeout(timeout);
+    signal.removeEventListener("abort", abort);
   }
 }
 
@@ -5236,11 +6540,12 @@ function buildThreadOptions(
   },
 ): Parameters<CodexClient["startThread"]>[0] {
   const runtime = resolveRuntimeOptions(options.runtimeMode);
+  const reasoningEffort = KnownReasoningEffortSchema.safeParse(options.reasoningEffort);
   return {
     ...base,
     ...runtime,
     ...(options.model ? { model: options.model } : {}),
-    ...(options.reasoningEffort ? { modelReasoningEffort: options.reasoningEffort as never } : {}),
+    ...(reasoningEffort.success ? { modelReasoningEffort: reasoningEffort.data } : {}),
     ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy as never } : {}),
     ...(options.sandboxMode ? { sandboxMode: options.sandboxMode as never } : {}),
   };
@@ -5359,6 +6664,7 @@ function mapAppServerThread(
 ): ThreadMetadata {
   const createdAt = fromUnixSeconds(thread.createdAt);
   const updatedAt = fromUnixSeconds(thread.updatedAt);
+  const lastActivityAt = fromUnixSeconds(thread.recencyAt ?? thread.updatedAt);
   const messageCount = Math.max(
     thread.turns ? countThreadMessages(thread) : 0,
     fallbackMessageCount ?? 0,
@@ -5366,7 +6672,8 @@ function mapAppServerThread(
   const mappedState = mapAppServerThreadState(thread.status, thread.turns);
   return ThreadSummarySchema.parse({
     id: thread.id,
-    title: thread.name ?? preview(thread.preview || "Untitled thread"),
+    parentThreadId: thread.parentThreadId ?? undefined,
+    title: appServerThreadTitle(thread),
     createdAt,
     updatedAt,
     state: mappedState,
@@ -5374,20 +6681,65 @@ function mapAppServerThread(
     source: thread.source,
     messageCount,
     lastMessagePreview: thread.preview ? preview(thread.preview) : undefined,
-    lastActivityAt: updatedAt,
+    lastActivityAt,
   });
 }
 
-function rememberAppServerThread(threads: Map<string, ThreadMetadata>, thread: AppServerThread) {
+function appServerThreadTitle(thread: Pick<AppServerThread, "name" | "preview">) {
+  return thread.name ?? preview(thread.preview || "Untitled thread");
+}
+
+function rememberAppServerThread(
+  threads: Map<string, ThreadMetadata>,
+  thread: AppServerThread,
+  options: { authoritativeMessageCount?: boolean } = {},
+) {
   const existingThread = threads.get(thread.id);
-  const mappedThread = mapAppServerThread(thread, existingThread?.messageCount);
+  const mappedThread = mapAppServerThread(
+    thread,
+    options.authoritativeMessageCount ? undefined : existingThread?.messageCount,
+  );
   const threadWithLocalRuntime = ThreadSummarySchema.parse({
     ...mappedThread,
+    goal: existingThread?.goal ?? mappedThread.goal,
     ...runtimeMetadataFromOptions(existingThread ?? {}),
     model: existingThread?.model ?? mappedThread.model,
   });
   threads.set(threadWithLocalRuntime.id, threadWithLocalRuntime);
   return threadWithLocalRuntime;
+}
+
+function isSubagentThread(thread: { readonly parentThreadId?: string | null }) {
+  return Boolean(thread.parentThreadId);
+}
+
+function mapAppServerThreadGoal(goal: AppServerThreadGoal | null): ThreadGoal | null {
+  if (!goal) {
+    return null;
+  }
+  return ThreadGoalSchema.parse({
+    ...goal,
+    createdAt: fromUnixSeconds(goal.createdAt),
+    updatedAt: fromUnixSeconds(goal.updatedAt),
+  });
+}
+
+function appServerThreadGoalFromParams(params: Record<string, unknown> | undefined) {
+  const parsed = AppServerThreadGoalPayloadSchema.safeParse(params?.goal);
+  return parsed.success ? parsed.data : null;
+}
+
+function rememberThreadGoal(
+  threads: Map<string, ThreadMetadata>,
+  thread: ThreadMetadata,
+  goal: ThreadGoal | null,
+) {
+  const next = ThreadSummarySchema.parse({
+    ...thread,
+    goal,
+  });
+  threads.set(next.id, next);
+  return next;
 }
 
 function preserveKnownRunningThreadState(thread: ThreadMetadata, wasKnownRunning: boolean) {
@@ -5411,6 +6763,16 @@ function mapAppServerMessages(thread: AppServerThread): ChatMessage[] {
     }
   }
   return messages;
+}
+
+function appServerThreadHasCompleteHistory(thread: AppServerThread) {
+  return (thread.turns ?? []).every(
+    (turn) => turn.itemsView === undefined || turn.itemsView === "full",
+  );
+}
+
+function isAsyncAppServerAgentMessage(item: AppServerThreadItem) {
+  return item.type === "agentMessage" && "delivery" in item && item.delivery === "async";
 }
 
 function mergeAppServerMessagesWithLocalStatus(
@@ -5645,9 +7007,19 @@ function readSessionIndexThreadTitle(threadId: string) {
   return undefined;
 }
 
-function readRolloutThreadMessages(threadId: string, workspacePath = defaultWorkspacePath) {
-  const rolloutPath = findRolloutFileForThread(threadId);
+function readRolloutThreadMessages(
+  threadId: string,
+  workspacePath = defaultWorkspacePath,
+  selectedRolloutPath?: string,
+) {
+  const rolloutPath =
+    selectedRolloutPath && selectedRolloutPath.endsWith(".jsonl") && existsSync(selectedRolloutPath)
+      ? selectedRolloutPath
+      : findRolloutFileForThread(threadId);
   if (!rolloutPath) {
+    return { messageCountLowerBound: 0, messages: [], rolloutPath };
+  }
+  if (isPaginatedRolloutFile(rolloutPath)) {
     return { messageCountLowerBound: 0, messages: [], rolloutPath };
   }
 
@@ -5655,6 +7027,7 @@ function readRolloutThreadMessages(threadId: string, workspacePath = defaultWork
   const applyPatchInputs = new Map<string, string>();
   const handledApplyPatchCallIds = new Set<string>();
   const pendingApplyPatchChanges: RolloutPatchChange[] = [];
+  let activeTurnId: string | undefined;
   const lines = readFileSync(rolloutPath, "utf8").split("\n");
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!;
@@ -5671,6 +7044,7 @@ function readRolloutThreadMessages(threadId: string, workspacePath = defaultWork
         timestamp?: unknown;
         type?: unknown;
       };
+      activeTurnId = firstString(record.payload, ["turn_id", "turnId"]) ?? activeTurnId;
       rememberRolloutApplyPatchInput(record, applyPatchInputs);
       collectRolloutApplyPatchOutput(
         record,
@@ -5689,6 +7063,7 @@ function readRolloutThreadMessages(threadId: string, workspacePath = defaultWork
           ),
         );
         pendingApplyPatchChanges.length = 0;
+        activeTurnId = undefined;
         continue;
       }
       const message = rolloutRecordMessage(
@@ -5696,7 +7071,11 @@ function readRolloutThreadMessages(threadId: string, workspacePath = defaultWork
         record,
         `rollout:${lineNumber}`,
         workspacePath,
+        activeTurnId,
       );
+      if (isRolloutTaskComplete(record)) {
+        activeTurnId = undefined;
+      }
       if (!message) {
         continue;
       }
@@ -5719,6 +7098,35 @@ function readRolloutThreadMessages(threadId: string, workspacePath = defaultWork
     messages: collected,
     rolloutPath,
   };
+}
+
+function isPaginatedRolloutFile(rolloutPath: string) {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(rolloutPath, "r");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
+    const prefix = buffer.toString("utf8", 0, bytesRead);
+    for (const line of prefix.split("\n")) {
+      if (!line.trim()) {
+        continue;
+      }
+      const record = JSON.parse(line) as {
+        payload?: Record<string, unknown>;
+        type?: unknown;
+      };
+      if (record.type === "session_meta") {
+        return record.payload?.history_mode === "paginated";
+      }
+    }
+  } catch {
+    return false;
+  } finally {
+    if (descriptor !== undefined) {
+      closeSync(descriptor);
+    }
+  }
+  return false;
 }
 
 function findRolloutFileForThread(threadId: string) {
@@ -5759,12 +7167,35 @@ function rolloutRecordMessage(
   record: { payload?: Record<string, unknown>; timestamp?: unknown; type?: unknown },
   messageKey: string,
   workspacePath = defaultWorkspacePath,
+  turnId?: string,
 ) {
   const timestamp =
     typeof record.timestamp === "string" ? record.timestamp : new Date().toISOString();
   const payload = record.payload;
   if (!payload) {
     return undefined;
+  }
+
+  if (record.type === "response_item" && payload.type === "message") {
+    const role = firstString(payload, ["role"]);
+    if (role !== "user" && role !== "assistant") {
+      return undefined;
+    }
+    const content = rolloutResponseItemMessageContent(payload, role);
+    if (!content) {
+      return undefined;
+    }
+    const messageParts = role === "assistant" ? agentMessageParts(content) : undefined;
+    return ChatMessageSchema.parse({
+      id: firstString(payload, ["id"]) ?? `${messageKey}:${role}`,
+      threadId,
+      role,
+      content: messageParts?.content ?? content,
+      details: messageParts?.details,
+      createdAt: timestamp,
+      state: "completed",
+      turnId,
+    });
   }
 
   if (record.type === "event_msg" && payload.type === "user_message") {
@@ -5780,6 +7211,7 @@ function rolloutRecordMessage(
       details: rolloutUserMessageDetails(payload),
       createdAt: timestamp,
       state: "completed",
+      turnId,
     });
   }
 
@@ -5797,6 +7229,7 @@ function rolloutRecordMessage(
       details: messageParts.details,
       createdAt: timestamp,
       state: "completed",
+      turnId,
     });
   }
 
@@ -5867,6 +7300,30 @@ function rolloutRecordMessage(
   }
 
   return undefined;
+}
+
+function rolloutResponseItemMessageContent(
+  payload: Record<string, unknown>,
+  role: "assistant" | "user",
+) {
+  if (!Array.isArray(payload.content)) {
+    return undefined;
+  }
+  const expectedType = role === "user" ? "input_text" : "output_text";
+  const text = payload.content.flatMap((item) => {
+    if (!item || typeof item !== "object") {
+      return [];
+    }
+    const contentItem = item as Record<string, unknown>;
+    if (contentItem.type !== expectedType || typeof contentItem.text !== "string") {
+      return [];
+    }
+    if (role === "user" && isCodexInjectedContextBlock(contentItem.text)) {
+      return [];
+    }
+    return [contentItem.text];
+  });
+  return text.length > 0 ? text.join("\n\n") : undefined;
 }
 
 function rolloutUserMessageDetails(payload: Record<string, unknown>) {
@@ -6113,11 +7570,13 @@ function isRolloutMessageLine(line: string) {
       (line.includes('"type":"user_message"') ||
         line.includes('"type":"agent_message"') ||
         line.includes('"type":"patch_apply_end"') ||
+        line.includes('"type":"task_started"') ||
         line.includes('"type":"task_complete"') ||
         line.includes('"type":"exec_command_end"') ||
         line.includes('"type":"mcp_tool_call_end"'))) ||
     (line.includes('"type":"response_item"') &&
-      (line.includes('"type":"custom_tool_call"') ||
+      (line.includes('"type":"message"') ||
+        line.includes('"type":"custom_tool_call"') ||
         line.includes('"type":"custom_tool_call_output"')))
   );
 }
@@ -6236,6 +7695,9 @@ function mapAppServerItem(threadId: string, turn: AppServerTurn, item: AppServer
 
   switch (item.type) {
     case "userMessage": {
+      if (isAppServerInjectedContextMessage(item)) {
+        return undefined;
+      }
       const userItem = item as Extract<AppServerThreadItem, { type: "userMessage" }>;
       return ChatMessageSchema.parse({
         ...base,
@@ -6248,12 +7710,17 @@ function mapAppServerItem(threadId: string, turn: AppServerTurn, item: AppServer
       const agentItem = item as Extract<AppServerThreadItem, { type: "agentMessage" }>;
       const planContent = proposedPlanContent(agentItem.text);
       const messageParts = appServerAgentMessageParts(agentItem);
+      const details = planContent
+        ? { raw: agentItem.text }
+        : agentItem.delivery || messageParts.details
+          ? { ...messageParts.details, delivery: agentItem.delivery ?? undefined }
+          : undefined;
       return ChatMessageSchema.parse({
         ...base,
         role: "assistant",
         kind: planContent ? "plan" : undefined,
         content: planContent ?? messageParts.content,
-        details: planContent ? { raw: agentItem.text } : messageParts.details,
+        details,
       });
     }
     case "reasoning": {
@@ -6319,6 +7786,41 @@ function mapAppServerItem(threadId: string, turn: AppServerTurn, item: AppServer
         },
       });
     }
+    case "collabAgentToolCall": {
+      const collabItem = item as Extract<AppServerThreadItem, { type: "collabAgentToolCall" }>;
+      return ChatMessageSchema.parse({
+        ...base,
+        role: "tool",
+        kind: "subagentAction",
+        content: appServerCollabAgentToolCallContent(collabItem),
+        details: {
+          type: collabItem.type,
+          tool: collabItem.tool,
+          status: collabItem.status,
+          senderThreadId: collabItem.senderThreadId,
+          receiverThreadIds: collabItem.receiverThreadIds,
+          prompt: collabItem.prompt ?? undefined,
+          model: collabItem.model ?? undefined,
+          reasoningEffort: collabItem.reasoningEffort ?? undefined,
+          agentsStates: collabItem.agentsStates,
+        },
+      });
+    }
+    case "subAgentActivity": {
+      const activityItem = item as Extract<AppServerThreadItem, { type: "subAgentActivity" }>;
+      return ChatMessageSchema.parse({
+        ...base,
+        role: "status",
+        kind: "subagentAction",
+        content: `${activityItem.agentPath || activityItem.agentThreadId} ${activityItem.kind}`,
+        details: {
+          type: activityItem.type,
+          activityKind: activityItem.kind,
+          agentThreadId: activityItem.agentThreadId,
+          agentPath: activityItem.agentPath,
+        },
+      });
+    }
     case "webSearch": {
       const searchItem = item as Extract<AppServerThreadItem, { type: "webSearch" }>;
       return ChatMessageSchema.parse({
@@ -6331,6 +7833,25 @@ function mapAppServerItem(threadId: string, turn: AppServerTurn, item: AppServer
     }
     default:
       return mapUnknownAppServerItem(threadId, turn, item);
+  }
+}
+
+function appServerCollabAgentToolCallContent(
+  item: Extract<AppServerThreadItem, { type: "collabAgentToolCall" }>,
+) {
+  const targetCount = item.receiverThreadIds.length;
+  const target = targetCount === 1 ? "subagent" : `${targetCount} subagents`;
+  switch (item.tool) {
+    case "spawnAgent":
+      return targetCount > 0 ? `Spawned ${target}` : "Spawned subagent";
+    case "sendInput":
+      return `Sent input to ${target}`;
+    case "resumeAgent":
+      return `Resumed ${target}`;
+    case "wait":
+      return targetCount > 0 ? `Waited for ${target}` : "Waited for subagents";
+    case "closeAgent":
+      return `Closed ${target}`;
   }
 }
 
@@ -6365,6 +7886,14 @@ function appServerTurnShell(turnId: string | undefined): AppServerTurn {
 }
 
 function mapAppServerModel(model: AppServerModel) {
+  const reasoningEffortOptions =
+    model.supportedReasoningEfforts?.flatMap((effort) => {
+      const parsed = ReasoningEffortSchema.safeParse(effort.reasoningEffort);
+      return parsed.success
+        ? [{ reasoningEffort: parsed.data, description: effort.description }]
+        : [];
+    }) ?? [];
+  const defaultReasoningEffort = ReasoningEffortSchema.safeParse(model.defaultReasoningEffort);
   const serviceTiers =
     model.serviceTiers ??
     model.additionalSpeedTiers?.map((tier) => ({
@@ -6379,9 +7908,11 @@ function mapAppServerModel(model: AppServerModel) {
     displayName: model.displayName,
     description: model.description,
     isDefault: Boolean(model.isDefault),
-    defaultReasoningEffort: model.defaultReasoningEffort,
-    supportedReasoningEfforts:
-      model.supportedReasoningEfforts?.map((effort) => effort.reasoningEffort) ?? [],
+    defaultReasoningEffort: defaultReasoningEffort.success
+      ? defaultReasoningEffort.data
+      : undefined,
+    supportedReasoningEfforts: reasoningEffortOptions.map((effort) => effort.reasoningEffort),
+    reasoningEffortOptions,
     serviceTiers,
   };
 }
@@ -6443,31 +7974,71 @@ function objectRecord(value: unknown) {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
+// Mirrors the GPT-6 lineup of the bundled Codex catalog for when the host catalog is unavailable.
 function fallbackModels(): AppServerModel[] {
+  const efforts = ["low", "medium", "high", "xhigh", "max"];
   return [
-    {
-      id: defaultCodexModel,
-      model: defaultCodexModel,
-      displayName: "GPT-5.5",
-      description: "Default Codex model",
+    fallbackModel({
+      description: "Frontier intelligence for the most demanding work.",
+      displayName: "GPT-6-Astra",
+      efforts: [...efforts, "ultra"],
+      fastDescription: "2x speed, increased usage",
       isDefault: true,
-      defaultReasoningEffort: "medium",
-      supportedReasoningEfforts: [
-        { reasoningEffort: "low" },
-        { reasoningEffort: "medium" },
-        { reasoningEffort: "high" },
-        { reasoningEffort: "xhigh" },
-      ],
-      additionalSpeedTiers: ["fast"],
-      serviceTiers: [
-        {
-          id: "priority",
-          name: "Fast",
-          description: "1.5x speed, increased usage",
-        },
-      ],
-    },
+      model: defaultCodexModel,
+    }),
+    fallbackModel({
+      defaultReasoningEffort: "low",
+      description: "Latest workhorse model for coding and everyday work.",
+      displayName: "GPT-6.1-Sol",
+      efforts: [...efforts, "ultra"],
+      fastDescription: "2x speed, increased usage",
+      model: "gpt-6.1-sol",
+    }),
+    fallbackModel({
+      description: "Previous generation workhorse model.",
+      displayName: "GPT-6-Sol",
+      efforts: [...efforts, "ultra"],
+      fastDescription: "1.5x speed",
+      model: "gpt-6-sol",
+    }),
+    fallbackModel({
+      description: "Fast and affordable model for easier tasks.",
+      displayName: "GPT-6-Luna",
+      efforts,
+      fastDescription: "1.5x speed",
+      model: "gpt-6-luna",
+    }),
   ];
+}
+
+function fallbackModel({
+  defaultReasoningEffort = "medium",
+  description,
+  displayName,
+  efforts,
+  fastDescription,
+  isDefault = false,
+  model,
+}: {
+  defaultReasoningEffort?: string;
+  description: string;
+  displayName: string;
+  efforts: string[];
+  fastDescription: string;
+  isDefault?: boolean;
+  model: string;
+}): AppServerModel {
+  return {
+    id: model,
+    model,
+    displayName,
+    description,
+    isDefault,
+    defaultReasoningEffort,
+    supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })),
+    additionalSpeedTiers: ["fast"],
+    serviceTiers: [{ id: "priority", name: "Fast", description: fastDescription }],
+  };
 }
 
 function mapAppServerThreadState(status: unknown, turns?: AppServerTurn[]) {
@@ -6540,8 +8111,11 @@ function countThreadMessages(thread: AppServerThread) {
     thread.turns?.reduce(
       (count, turn) =>
         count +
-        turn.items.filter((item) => item.type === "userMessage" || item.type === "agentMessage")
-          .length,
+        turn.items.filter(
+          (item) =>
+            item.type === "agentMessage" ||
+            (item.type === "userMessage" && !isAppServerInjectedContextMessage(item)),
+        ).length,
       0,
     ) ?? 0
   );
@@ -6637,6 +8211,25 @@ function structuredStreamMessage(
           type,
         },
       };
+    case "todo_list": {
+      const items = Array.isArray(item?.items) ? item.items : [];
+      const content = items
+        .flatMap((entry) => {
+          if (!entry || typeof entry !== "object") {
+            return [];
+          }
+          const todo = entry as Record<string, unknown>;
+          return typeof todo.text === "string"
+            ? [`[${todo.completed === true ? "x" : " "}] ${todo.text}`]
+            : [];
+        })
+        .join("\n");
+      return {
+        kind: "plan",
+        content: content || fallbackContent,
+        details: { items, type },
+      };
+    }
     default:
       return {
         kind: kindFromProtocolType(type) ?? (role === "tool" ? "toolActivity" : "unknown"),
@@ -6644,6 +8237,33 @@ function structuredStreamMessage(
         details: { type },
       };
   }
+}
+
+function isCompletedAgentMessageEvent(event: unknown) {
+  if (!event || typeof event !== "object") {
+    return false;
+  }
+
+  return (
+    (event as Record<string, unknown>).type === "item.completed" &&
+    eventItem(event)?.type === "agent_message"
+  );
+}
+
+function isRenderableStructuredStreamEvent(event: unknown) {
+  const type = eventItem(event)?.type;
+  return (
+    type === "file_change" ||
+    type === "mcp_tool_call" ||
+    type === "todo_list" ||
+    type === "web_search"
+  );
+}
+
+function streamItemState(event: unknown): "streaming" | "completed" {
+  return (event as Record<string, unknown> | null)?.type === "item.completed"
+    ? "completed"
+    : "streaming";
 }
 
 function isApprovalServerRequest(method: string) {
@@ -6658,6 +8278,101 @@ function isApprovalServerRequest(method: string) {
   );
 }
 
+function observeAppServerPushNotifications(
+  appServer: CodexAppServerClient,
+  dispatcher: PushNotificationDispatcher,
+) {
+  const dispatchedEventIds = new Set<string>();
+  const rememberEventId = (eventId: string) => {
+    if (dispatchedEventIds.size >= 1000) {
+      dispatchedEventIds.clear();
+    }
+    dispatchedEventIds.add(eventId);
+  };
+  const dispatch = (event: PushNotificationEvent, eventId: string) => {
+    if (dispatchedEventIds.has(eventId)) {
+      return;
+    }
+    rememberEventId(eventId);
+    void appServer
+      .readThread(event.threadId, { includeTurns: false })
+      .then((thread) => {
+        if (!isSubagentThread(thread)) {
+          return dispatcher.dispatch({
+            ...event,
+            threadTitle: appServerThreadTitle(thread),
+          });
+        }
+      })
+      .catch((error) => {
+        relayDebugLog("push_notification.dispatch_failed", {
+          error: errorMessage(error),
+          intent: event.intent,
+          threadId: event.threadId,
+          turnId: event.turnId,
+        });
+      });
+  };
+
+  appServer.onNotification((notification) => {
+    const event = pushNotificationEventFromTerminalNotification(notification);
+    if (!event) {
+      return;
+    }
+    const eventId = `${event.intent}:${event.threadId}:${event.turnId ?? ""}`;
+    dispatch(event, eventId);
+  });
+
+  appServer.onRequest((request) => {
+    const event = pushNotificationEventFromApprovalRequest(request);
+    if (!event) {
+      return;
+    }
+    const eventId = `${event.intent}:${event.threadId}:${event.turnId ?? ""}:${request.id}`;
+    dispatch(event, eventId);
+  });
+}
+
+function pushNotificationEventFromTerminalNotification(notification: AppServerNotification) {
+  if (notification.method !== "turn/completed" && notification.method !== "turn/failed") {
+    return undefined;
+  }
+  const params = recordParams(notification);
+  const status = turnStatus(params);
+  if (
+    status === "aborted" ||
+    status === "cancelled" ||
+    status === "canceled" ||
+    status === "interrupted"
+  ) {
+    return undefined;
+  }
+  const threadId = firstString(params, ["threadId", "conversationId"]);
+  if (!threadId) {
+    return undefined;
+  }
+  return {
+    intent: "turn_terminal" as const,
+    threadId,
+    turnId: firstString(params, ["turnId"]) ?? turnIdFromParams(params),
+  };
+}
+
+function pushNotificationEventFromApprovalRequest(request: AppServerRequest) {
+  if (!isApprovalServerRequest(request.method)) {
+    return undefined;
+  }
+  const approval = approvalMessageFromRequest(request);
+  if (!approval) {
+    return undefined;
+  }
+  return {
+    intent: "action_required" as const,
+    threadId: approval.threadId,
+    turnId: approval.turnId,
+  };
+}
+
 function approvalMessageFromRequest(request: AppServerRequest) {
   const params = recordParams(request);
   const threadId = firstString(params, ["threadId", "conversationId"]);
@@ -6666,7 +8381,7 @@ function approvalMessageFromRequest(request: AppServerRequest) {
     return undefined;
   }
 
-  const approvalId = `approval-${request.id}`;
+  const approvalId = appServerApprovalId(threadId, request.id);
   switch (request.method) {
     case "item/commandExecution/requestApproval": {
       const command = firstString(params, ["command"]) ?? "Command execution";
@@ -6759,6 +8474,7 @@ function approvalMessageFromRequest(request: AppServerRequest) {
           questions,
         },
         kind: "structuredUserInput" as const,
+        isBlocking: typeof params?.isBlocking === "boolean" ? params.isBlocking : true,
         questions,
         threadId,
         turnId,
@@ -6845,6 +8561,7 @@ function pendingInputOptions(value: unknown) {
 function pendingInputRequestFromApproval(
   approval: {
     approvalId: string;
+    isBlocking?: boolean;
     questions?: PendingInputRequestQuestion[];
     turnId?: string;
   },
@@ -6852,6 +8569,7 @@ function pendingInputRequestFromApproval(
 ): PendingInputRequest {
   return {
     id: approval.approvalId,
+    isBlocking: approval.isBlocking ?? true,
     questions: approval.questions ?? [],
     threadId,
     turnId: approval.turnId,
@@ -6869,6 +8587,7 @@ function pendingInputRequestsForThread(
     return [
       {
         id: approvalId,
+        isBlocking: pending.isBlocking ?? true,
         questions: pending.questions ?? [],
         threadId,
         turnId: pending.turnId,
@@ -6998,6 +8717,10 @@ function kindFromProtocolType(type: string | undefined) {
       return "approvalRequest";
     case "subagent_action":
     case "subagentAction":
+    case "collab_agent_tool_call":
+    case "collabAgentToolCall":
+    case "sub_agent_activity":
+    case "subAgentActivity":
       return "subagentAction";
     default:
       return undefined;
@@ -7026,6 +8749,35 @@ function turnIdFromParams(params: Record<string, unknown> | undefined) {
   return turn && typeof turn === "object"
     ? firstString(turn as Record<string, unknown>, ["id"])
     : undefined;
+}
+
+function appServerRequestIdFromParams(params: Record<string, unknown> | undefined) {
+  const requestId = params?.requestId;
+  return typeof requestId === "number" || typeof requestId === "string" ? requestId : undefined;
+}
+
+function appServerApprovalId(threadId: string, requestId: number | string) {
+  const digest = createHash("sha256")
+    .update(threadId)
+    .update("\0")
+    .update(String(requestId))
+    .digest("hex")
+    .slice(0, 24);
+  return `approval-${digest}`;
+}
+
+function appServerTurnFromParams(
+  params: Record<string, unknown> | undefined,
+): AppServerTurn | undefined {
+  const turn = params?.turn;
+  if (!turn || typeof turn !== "object") {
+    return undefined;
+  }
+  const record = turn as Record<string, unknown>;
+  if (typeof record.id !== "string" || !Array.isArray(record.items)) {
+    return undefined;
+  }
+  return turn as AppServerTurn;
 }
 
 function turnStatus(params: Record<string, unknown> | undefined) {
@@ -7175,6 +8927,11 @@ function firstString(record: Record<string, unknown> | undefined, keys: string[]
     }
   }
   return undefined;
+}
+
+function streamDelta(record: Record<string, unknown> | undefined) {
+  const value = record?.delta;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function firstNumber(record: Record<string, unknown> | undefined, keys: string[]) {
@@ -7495,8 +9252,8 @@ function createWorkspaceTerminalSession(input: {
 }): WorkspaceTerminalSession {
   const sessionId = randomUUID();
   const startedAt = new Date().toISOString();
-  const shell = process.env.SHELL || "/bin/sh";
-  const child = pty.spawn(shell, ["-l"], {
+  const shell = resolveWorkspaceTerminalShell();
+  const child = pty.spawn(shell.command, [...shell.args], {
     cols: input.cols,
     cwd: input.cwd,
     env: {
@@ -8077,4 +9834,12 @@ function apiError(code: string, message: string, issues?: string[]): ErrorRespon
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Codex run failed.";
+}
+
+function isMissingAppServerMethodError(error: unknown, method: string) {
+  const message = errorMessage(error);
+  // Codex rejects unknown methods as an invalid request naming the unknown variant.
+  return (
+    /method not found|-32601/i.test(message) || message.includes(`unknown variant \`${method}\``)
+  );
 }

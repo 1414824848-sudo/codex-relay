@@ -1,10 +1,10 @@
-import { HotUpdater } from "@hot-updater/react-native";
 import { useSelector } from "@legendapp/state/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import Constants from "expo-constants";
 import { router } from "expo-router";
 import { Heart } from "lucide-react-native";
-import { useEffect, useRef, useState } from "react";
-import { Alert, Linking, Pressable, ScrollView, View } from "react-native";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { Alert, Linking, Pressable, ScrollView, Switch, View } from "react-native";
 import Animated, { FadeIn, FadeOut, LinearTransition } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StyleSheet } from "react-native-unistyles";
@@ -21,17 +21,31 @@ import {
 import { Colors, Fonts, MaxContentWidth, Spacing } from "@/constants/theme";
 import {
   getCodexRelayServerUrlCandidates,
+  getPushNotificationSettings,
+  registerPushNotifications,
   refreshSession,
   setCodexRelayServerUrl,
   signOutCodexRelaySession,
+  unregisterPushNotifications,
   type CodexRelayServerUrlCandidate,
 } from "@/lib/codex-relay-api";
 import { hapticSelection, hapticWarning } from "@/lib/haptics";
+import { hotUpdater, hotUpdaterBaseUrl } from "@/lib/hot-updater";
 import {
+  addHotUpdaterLog,
   clearHotUpdaterLogs,
   formatHotUpdaterLogTime,
+  hotUpdaterErrorDetails,
   useHotUpdaterLogs,
 } from "@/lib/hot-updater-logs";
+import { formatMobileReleaseVersion } from "@/lib/mobile-release-version";
+import {
+  defaultPushNotificationPreferences,
+  getExpoPushToken,
+  markInitialPushNotificationRegistrationCompleted,
+  pushNotificationPlatform,
+  supportsPushNotifications,
+} from "@/lib/push-notifications";
 import { formatRateLimitRemaining, visibleRateLimitRows } from "@/lib/rate-limits";
 import {
   clearServerState,
@@ -43,12 +57,20 @@ import {
 } from "@/lib/server-state";
 import { chatStore$, resetChatSessionState, setConnection, setServerUrl } from "@/state/chat-store";
 
-const hotUpdaterBaseUrl = process.env.EXPO_PUBLIC_HOT_UPDATER_BASE_URL?.trim();
+import mobilePackage from "../../package.json";
+
 const hotUpdaterBaseUrlStatus = hotUpdaterBaseUrl ? "configured" : "missing";
+const pushNotificationTrackColor = {
+  false: "rgba(255, 255, 255, 0.16)",
+  true: "#2CA36F",
+};
+
+type PushNotificationPreference = keyof typeof defaultPushNotificationPreferences;
 
 export default function SettingsScreen() {
   const queryClient = useQueryClient();
   const connection = useSelector(() => chatStore$.connection.get());
+  const hasPairedSession = useSelector(() => chatStore$.hasPairedSession.get());
   const serverUrl = useSelector(() => chatStore$.serverUrl.get());
   const statusQuery = useQuery({
     queryKey: serverStateKeys.status(),
@@ -61,8 +83,13 @@ export default function SettingsScreen() {
     enabled: connection === "connected",
   });
   const machineName = statusQuery.data?.machineName;
-  const computerName = machineName ?? connectedComputerName(serverUrl);
-  const [appVersion] = useState(() => HotUpdater.getAppVersion() ?? "1.0.0");
+  const computerName = hasPairedSession
+    ? (machineName ?? connectedComputerName(serverUrl))
+    : "No paired computer";
+  const [appVersion] = useState(
+    () => hotUpdater?.getAppVersion() ?? Constants.expoConfig?.version ?? "1.0.0",
+  );
+  const releaseVersionLabel = formatMobileReleaseVersion(appVersion, mobilePackage.version);
   const [appliedBundleSuffix] = useState(appliedHotUpdateBundleSuffix);
   const hotUpdaterTapCountRef = useRef(0);
   const [showHotUpdaterLogs, setShowHotUpdaterLogs] = useState(false);
@@ -75,6 +102,12 @@ export default function SettingsScreen() {
     status: "checking",
     updateInfo: null,
   });
+  const [pushNotificationPreferences, setPushNotificationPreferences] = useState(
+    defaultPushNotificationPreferences,
+  );
+  const [pushNotificationsLoading, setPushNotificationsLoading] = useState(false);
+  const [pushNotificationsUpdating, setPushNotificationsUpdating] = useState(false);
+  const pushNotificationsSupported = supportsPushNotifications();
   const rateLimitRows = visibleRateLimitRows(rateLimitsQuery.data?.buckets ?? []);
   const isAppUpdatePending =
     appUpdate.status === "downloading" ||
@@ -94,7 +127,11 @@ export default function SettingsScreen() {
 
     async function checkForAppUpdate() {
       try {
-        const updateInfo = await HotUpdater.checkForUpdate({
+        if (hotUpdater === null) {
+          setAppUpdate({ status: "current", updateInfo: null });
+          return;
+        }
+        const updateInfo = await hotUpdater.checkForUpdate({
           updateStrategy: "appVersion",
         });
 
@@ -116,6 +153,15 @@ export default function SettingsScreen() {
         });
 
         const didDownload = await updateInfo.updateBundle();
+
+        // A force update runs right away instead of waiting for Restart.
+        if (didDownload && updateInfo.shouldForceUpdate) {
+          if (isActive) {
+            setAppUpdate({ status: "updating", updateInfo });
+          }
+          await hotUpdater.reload();
+          return;
+        }
 
         if (!isActive) {
           return;
@@ -143,6 +189,39 @@ export default function SettingsScreen() {
     setServerUrlCandidates(getCodexRelayServerUrlCandidates());
   }, [serverUrl]);
 
+  useEffect(() => {
+    let isActive = true;
+    if (!hasPairedSession || !pushNotificationsSupported) {
+      setPushNotificationPreferences(defaultPushNotificationPreferences);
+      setPushNotificationsLoading(false);
+      return () => {
+        isActive = false;
+      };
+    }
+
+    setPushNotificationsLoading(true);
+    void getPushNotificationSettings()
+      .then((settings) => {
+        if (isActive) {
+          setPushNotificationPreferences(settings.preferences);
+        }
+      })
+      .catch(() => {
+        if (isActive) {
+          setPushNotificationPreferences(defaultPushNotificationPreferences);
+        }
+      })
+      .finally(() => {
+        if (isActive) {
+          setPushNotificationsLoading(false);
+        }
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [hasPairedSession, pushNotificationsSupported, serverUrl]);
+
   function closeSettings() {
     hapticSelection();
     if (router.canGoBack()) {
@@ -158,6 +237,39 @@ export default function SettingsScreen() {
     clearServerState(queryClient);
     resetChatSessionState();
     router.replace("/");
+  }
+
+  async function updatePushNotificationPreference(
+    preference: PushNotificationPreference,
+    value: boolean,
+  ) {
+    if (pushNotificationsUpdating || !pushNotificationsSupported) {
+      return;
+    }
+
+    const previousPreferences = pushNotificationPreferences;
+    const nextPreferences = { ...previousPreferences, [preference]: value };
+    hapticSelection();
+    markInitialPushNotificationRegistrationCompleted();
+    setPushNotificationPreferences(nextPreferences);
+    setPushNotificationsUpdating(true);
+
+    try {
+      const settings = Object.values(nextPreferences).some(Boolean)
+        ? await registerPushNotifications({
+            expoPushToken: await getExpoPushToken(),
+            platform: pushNotificationPlatform(),
+            preferences: nextPreferences,
+          })
+        : await unregisterPushNotifications();
+      setPushNotificationPreferences(settings.preferences);
+    } catch (caught) {
+      setPushNotificationPreferences(previousPreferences);
+      hapticWarning();
+      Alert.alert("Notifications unavailable", settingsErrorMessage(caught));
+    } finally {
+      setPushNotificationsUpdating(false);
+    }
   }
 
   async function selectServerAddress(candidate: CodexRelayServerUrlCandidate) {
@@ -199,7 +311,7 @@ export default function SettingsScreen() {
     setAppUpdate((current) => ({ ...current, status: "updating" }));
 
     try {
-      await HotUpdater.reload();
+      await hotUpdater?.reload();
     } catch {
       setAppUpdate((current) => ({ ...current, status: "error" }));
       hapticWarning();
@@ -376,89 +488,159 @@ export default function SettingsScreen() {
                   </ThemedText>
                 </View>
               </Animated.View>
-              <InfoLine label="Server" value={compactServer(serverUrl)} />
-              <View style={styles.serverAddressList}>
-                {serverUrlCandidates.map((candidate) => {
-                  const isSelected = candidate.url === serverUrl;
-                  const isSwitching = switchingServerUrl === candidate.url;
-                  return (
-                    <Pressable
-                      key={candidate.url}
-                      accessibilityRole="button"
-                      accessibilityLabel={`Use ${compactServer(candidate.url)}`}
-                      disabled={isSelected || Boolean(switchingServerUrl)}
-                      onPress={() => void selectServerAddress(candidate)}
-                      style={({ pressed }) => [
-                        styles.serverAddressRow,
-                        isSelected && styles.serverAddressRowSelected,
-                        pressed && styles.pressed,
-                      ]}
-                    >
-                      <View style={styles.serverAddressCopy}>
-                        <ThemedText type="smallBold" style={styles.serverAddressLabel}>
-                          {candidate.label}
-                        </ThemedText>
-                        <ThemedText
-                          type="code"
-                          themeColor="textSecondary"
-                          style={styles.serverAddressValue}
-                          numberOfLines={1}
-                        >
-                          {compactServer(candidate.url)}
-                        </ThemedText>
-                      </View>
-                      <View
-                        style={[
-                          styles.serverAddressStatus,
-                          isSelected && styles.serverAddressStatusSelected,
-                        ]}
-                      >
-                        <ThemedText
-                          type="code"
-                          style={[
-                            styles.serverAddressStatusText,
-                            isSelected && styles.serverAddressStatusTextSelected,
+              {hasPairedSession ? (
+                <>
+                  <InfoLine label="Server" value={compactServer(serverUrl)} />
+                  <View style={styles.serverAddressList}>
+                    {serverUrlCandidates.map((candidate) => {
+                      const isSelected = candidate.url === serverUrl;
+                      const isSwitching = switchingServerUrl === candidate.url;
+                      return (
+                        <Pressable
+                          key={candidate.url}
+                          accessibilityRole="button"
+                          accessibilityLabel={`Use ${compactServer(candidate.url)}`}
+                          disabled={isSelected || Boolean(switchingServerUrl)}
+                          onPress={() => void selectServerAddress(candidate)}
+                          style={({ pressed }) => [
+                            styles.serverAddressRow,
+                            isSelected && styles.serverAddressRowSelected,
+                            pressed && styles.pressed,
                           ]}
                         >
-                          {isSwitching ? "CHECKING" : isSelected ? "ACTIVE" : "USE"}
-                        </ThemedText>
-                      </View>
-                    </Pressable>
-                  );
-                })}
-              </View>
+                          <View style={styles.serverAddressCopy}>
+                            <ThemedText type="smallBold" style={styles.serverAddressLabel}>
+                              {candidate.label}
+                            </ThemedText>
+                            <ThemedText
+                              type="code"
+                              themeColor="textSecondary"
+                              style={styles.serverAddressValue}
+                              numberOfLines={1}
+                            >
+                              {compactServer(candidate.url)}
+                            </ThemedText>
+                          </View>
+                          <View
+                            style={[
+                              styles.serverAddressStatus,
+                              isSelected && styles.serverAddressStatusSelected,
+                            ]}
+                          >
+                            <ThemedText
+                              type="code"
+                              style={[
+                                styles.serverAddressStatusText,
+                                isSelected && styles.serverAddressStatusTextSelected,
+                              ]}
+                            >
+                              {isSwitching ? "CHECKING" : isSelected ? "ACTIVE" : "USE"}
+                            </ThemedText>
+                          </View>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </>
+              ) : (
+                <ThemedText type="small" themeColor="textSecondary" style={styles.unpairedCopy}>
+                  Pair this device from the main screen to choose a relay server.
+                </ThemedText>
+              )}
             </Animated.View>
           </Animated.View>
 
-          <Animated.View layout={settingsLayoutTransition} style={styles.section}>
-            <ThemedText type="small" themeColor="textSecondary" style={styles.sectionLabel}>
-              Session
-            </ThemedText>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Sign out"
-              onPress={signOut}
-              style={({ pressed }) => [styles.signOutRow, pressed && styles.pressed]}
-            >
-              <View style={styles.signOutContent}>
-                <View style={styles.signOutIconSlot}>
-                  <Icon name="signOut" size={17} tintColor="#FFB4A8" />
-                </View>
-                <View style={styles.signOutCopy}>
-                  <ThemedText type="smallBold" style={styles.signOutTitle}>
-                    Sign out
-                  </ThemedText>
+          {hasPairedSession ? (
+            <Animated.View layout={settingsLayoutTransition} style={styles.section}>
+              <ThemedText type="small" themeColor="textSecondary" style={styles.sectionLabel}>
+                Notifications
+              </ThemedText>
+              <Animated.View layout={settingsLayoutTransition} style={styles.notificationPanel}>
+                {pushNotificationsSupported ? (
+                  <>
+                    <ThemedText
+                      type="small"
+                      themeColor="textSecondary"
+                      style={styles.notificationIntro}
+                    >
+                      Generic alerts only. Chat content stays on your paired computer.
+                    </ThemedText>
+                    <PushNotificationToggle
+                      accessibilityLabel="Notify when a Codex turn ends"
+                      disabled={pushNotificationsLoading || pushNotificationsUpdating}
+                      onValueChange={(value) =>
+                        void updatePushNotificationPreference("turnTerminal", value)
+                      }
+                      subtitle="When Codex completes or fails a turn"
+                      title="Turn complete"
+                      value={pushNotificationPreferences.turnTerminal}
+                    />
+                    <PushNotificationToggle
+                      accessibilityLabel="Include remaining Codex usage in turn-complete notifications"
+                      disabled={pushNotificationsLoading || pushNotificationsUpdating}
+                      onValueChange={(value) =>
+                        void updatePushNotificationPreference("includeRemainingUsage", value)
+                      }
+                      subtitle="Show the lowest remaining Codex limit after a turn"
+                      title="Remaining usage"
+                      value={pushNotificationPreferences.includeRemainingUsage}
+                    />
+                    <PushNotificationToggle
+                      accessibilityLabel="Notify when Codex needs action"
+                      disabled={pushNotificationsLoading || pushNotificationsUpdating}
+                      onValueChange={(value) =>
+                        void updatePushNotificationPreference("actionRequired", value)
+                      }
+                      showDivider={false}
+                      subtitle="When Codex needs approval or input"
+                      title="Action required"
+                      value={pushNotificationPreferences.actionRequired}
+                    />
+                  </>
+                ) : (
                   <ThemedText
                     type="small"
                     themeColor="textSecondary"
-                    style={styles.signOutSubtitle}
+                    style={styles.notificationIntro}
                   >
-                    Pair again on this device
+                    Push notifications are available in the iOS and Android apps.
                   </ThemedText>
+                )}
+              </Animated.View>
+            </Animated.View>
+          ) : null}
+
+          {hasPairedSession ? (
+            <Animated.View layout={settingsLayoutTransition} style={styles.section}>
+              <ThemedText type="small" themeColor="textSecondary" style={styles.sectionLabel}>
+                Session
+              </ThemedText>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Sign out"
+                onPress={signOut}
+                style={({ pressed }) => [styles.signOutRow, pressed && styles.pressed]}
+              >
+                <View style={styles.signOutContent}>
+                  <View style={styles.signOutIconSlot}>
+                    <Icon name="signOut" size={17} tintColor="#FFB4A8" />
+                  </View>
+                  <View style={styles.signOutCopy}>
+                    <ThemedText type="smallBold" style={styles.signOutTitle}>
+                      Sign out
+                    </ThemedText>
+                    <ThemedText
+                      type="small"
+                      themeColor="textSecondary"
+                      style={styles.signOutSubtitle}
+                    >
+                      Pair again on this device
+                    </ThemedText>
+                  </View>
                 </View>
-              </View>
-            </Pressable>
-          </Animated.View>
+              </Pressable>
+            </Animated.View>
+          ) : null}
 
           <Animated.View layout={settingsLayoutTransition} style={styles.versionFooter}>
             <Animated.View layout={settingsLayoutTransition} style={styles.versionRow}>
@@ -476,7 +658,7 @@ export default function SettingsScreen() {
                   />
                 </View>
                 <ThemedText type="code" themeColor="textSecondary" style={styles.versionText}>
-                  Version {appVersion}
+                  Version {releaseVersionLabel}
                   {appUpdate.status === "checking" ? " · checking" : null}
                   {appUpdate.status === "current" ? " · current" : null}
                   {appUpdate.status === "downloading" ? " · downloading" : null}
@@ -534,7 +716,7 @@ export default function SettingsScreen() {
               >
                 <View style={styles.hotUpdaterLogHeader}>
                   <ThemedText type="smallBold" style={styles.hotUpdaterLogTitle}>
-                    Logs ({HotUpdater.getCohort()})
+                    Logs ({hotUpdater?.getCohort() ?? "none"})
                   </ThemedText>
                   <View style={styles.hotUpdaterLogActions}>
                     <Pressable
@@ -579,6 +761,9 @@ export default function SettingsScreen() {
                     {hotUpdaterBaseUrlStatus}
                   </ThemedText>
                 </View>
+                {hotUpdater?.remoteConfig ? (
+                  <RemoteConfigPanel remoteConfig={hotUpdater.remoteConfig} />
+                ) : null}
                 {hotUpdaterLogs.length > 0 ? (
                   hotUpdaterLogs.map((entry) => (
                     <View key={entry.id} style={styles.hotUpdaterLogRow}>
@@ -610,6 +795,50 @@ export default function SettingsScreen() {
         </ScrollView>
       </View>
     </SafeAreaView>
+  );
+}
+
+function PushNotificationToggle({
+  accessibilityLabel,
+  disabled,
+  onValueChange,
+  showDivider = true,
+  subtitle,
+  title,
+  value,
+}: {
+  accessibilityLabel: string;
+  disabled: boolean;
+  onValueChange: (value: boolean) => void;
+  showDivider?: boolean;
+  subtitle: string;
+  title: string;
+  value: boolean;
+}) {
+  return (
+    <Animated.View
+      entering={settingsEnterTransition}
+      exiting={settingsExitTransition}
+      layout={settingsLayoutTransition}
+      style={[styles.notificationRow, showDivider && styles.notificationRowDivider]}
+    >
+      <View style={styles.notificationCopy}>
+        <ThemedText type="smallBold" style={styles.notificationTitle}>
+          {title}
+        </ThemedText>
+        <ThemedText type="small" themeColor="textSecondary" style={styles.notificationSubtitle}>
+          {subtitle}
+        </ThemedText>
+      </View>
+      <Switch
+        accessibilityLabel={accessibilityLabel}
+        disabled={disabled}
+        onValueChange={onValueChange}
+        thumbColor={value ? "#DDF7E7" : "#BEC5C3"}
+        trackColor={pushNotificationTrackColor}
+        value={value}
+      />
+    </Animated.View>
   );
 }
 
@@ -762,8 +991,8 @@ function settingsErrorMessage(error: unknown) {
 
 function appliedHotUpdateBundleSuffix() {
   try {
-    const bundleId = HotUpdater.getBundleId();
-    if (!bundleId || bundleId === HotUpdater.getMinBundleId()) {
+    const bundleId = hotUpdater?.getBundleId();
+    if (!bundleId || bundleId === hotUpdater?.getMinBundleId()) {
       return undefined;
     }
     return bundleId.slice(-8);
@@ -772,7 +1001,79 @@ function appliedHotUpdateBundleSuffix() {
   }
 }
 
-type AppUpdateInfo = Awaited<ReturnType<typeof HotUpdater.checkForUpdate>>;
+/** The Remote Config the app has active, and a forced fetch to apply new values now. */
+function RemoteConfigPanel({
+  remoteConfig,
+}: {
+  remoteConfig: NonNullable<typeof hotUpdater>["remoteConfig"];
+}) {
+  const values = useSyncExternalStore(remoteConfig.subscribe, remoteConfig.getAll);
+  const [fetching, setFetching] = useState(false);
+  const notice = remoteConfig.getString("settings_notice");
+  const fetchedAtMs = remoteConfig.fetchedAtMs;
+
+  async function fetchNow() {
+    setFetching(true);
+    try {
+      const activated = await remoteConfig.fetchAndActivate({ force: true });
+      addHotUpdaterLog(
+        "info",
+        "Remote Config fetched",
+        [
+          `Activated: ${activated ? "new values" : "no change"}`,
+          `Version: ${remoteConfig.activeVersion}`,
+        ].join("\n"),
+      );
+    } catch (error) {
+      addHotUpdaterLog("warning", "Remote Config fetch failed", hotUpdaterErrorDetails(error));
+      hapticWarning();
+    } finally {
+      setFetching(false);
+    }
+  }
+
+  return (
+    <View style={styles.remoteConfigSection}>
+      <View style={styles.hotUpdaterLogHeader}>
+        <ThemedText type="smallBold" style={styles.hotUpdaterLogTitle}>
+          Remote Config v{remoteConfig.activeVersion}
+        </ThemedText>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Fetch Remote Config now"
+          disabled={fetching}
+          onPress={() => void fetchNow()}
+          style={({ pressed }) => [styles.hotUpdaterLogButton, pressed && styles.pressed]}
+        >
+          <ThemedText type="code" style={styles.hotUpdaterLogButtonText}>
+            {fetching ? "Fetching" : "Fetch"}
+          </ThemedText>
+        </Pressable>
+      </View>
+      <ThemedText type="code" themeColor="textSecondary" style={styles.hotUpdaterLogDetails}>
+        {remoteConfig.lastFetchStatus}
+        {fetchedAtMs === null ? null : ` · ${formatHotUpdaterLogTime(fetchedAtMs)}`}
+      </ThemedText>
+      {notice ? (
+        <ThemedText type="small" style={styles.hotUpdaterLogMessage}>
+          {notice}
+        </ThemedText>
+      ) : null}
+      {Object.entries(values).map(([key, value]) => (
+        <View key={key} style={styles.hotUpdaterConfigRow}>
+          <ThemedText type="code" style={styles.hotUpdaterConfigLabel}>
+            {key}
+          </ThemedText>
+          <ThemedText type="code" style={styles.hotUpdaterConfigValue} numberOfLines={2}>
+            {value.asString() === "" ? '""' : value.asString()} · {value.getSource()}
+          </ThemedText>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+type AppUpdateInfo = Awaited<ReturnType<NonNullable<typeof hotUpdater>["checkForUpdate"]>>;
 
 type AppUpdateState = {
   status: "checking" | "current" | "downloading" | "ready" | "updating" | "error";
@@ -989,6 +1290,10 @@ const styles = StyleSheet.create({
     fontSize: 9,
     lineHeight: 12,
   },
+  remoteConfigSection: {
+    gap: Spacing.one,
+    marginTop: Spacing.two,
+  },
   hotUpdaterConfigRow: {
     backgroundColor: "rgba(140, 199, 255, 0.07)",
     borderColor: "rgba(140, 199, 255, 0.14)",
@@ -1041,6 +1346,44 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     gap: Spacing.two,
     padding: Spacing.three,
+  },
+  notificationPanel: {
+    backgroundColor: Colors.dark.backgroundElement,
+    borderColor: "rgba(255, 255, 255, 0.09)",
+    borderRadius: 8,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  notificationIntro: {
+    fontSize: 12,
+    lineHeight: 17,
+    paddingHorizontal: Spacing.three,
+    paddingTop: Spacing.three,
+  },
+  notificationRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: Spacing.two,
+    minHeight: 70,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: 10,
+  },
+  notificationRowDivider: {
+    borderBottomColor: "rgba(255, 255, 255, 0.08)",
+    borderBottomWidth: 1,
+  },
+  notificationCopy: {
+    flex: 1,
+    gap: 2,
+    minWidth: 0,
+  },
+  notificationTitle: {
+    fontSize: 14,
+    lineHeight: 19,
+  },
+  notificationSubtitle: {
+    fontSize: 12,
+    lineHeight: 16,
   },
   usageCard: {
     backgroundColor: Colors.dark.backgroundElement,
@@ -1138,6 +1481,10 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 19,
     minWidth: 0,
+  },
+  unpairedCopy: {
+    fontSize: 13,
+    lineHeight: 18,
   },
   connectionBadge: {
     backgroundColor: "rgba(255, 255, 255, 0.06)",

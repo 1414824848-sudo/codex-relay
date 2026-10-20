@@ -30,8 +30,25 @@ export const ChatMessageKindSchema = z.enum([
 export const ApprovalModeSchema = z.enum(["on-request", "on-failure", "never"]);
 export const RuntimeModeSchema = z.enum(["default", "auto", "full-access", "on-request"]);
 export const SandboxModeSchema = z.enum(["workspace-write", "danger-full-access", "read-only"]);
-export const ReasoningEffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh"]);
+export const KnownReasoningEffortSchema = z.enum([
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
+export const ReasoningEffortSchema = z.string().trim().min(1);
 export const ThreadCollaborationModeSchema = z.enum(["default", "plan"]);
+export const ThreadGoalStatusSchema = z.enum([
+  "active",
+  "paused",
+  "blocked",
+  "usageLimited",
+  "budgetLimited",
+  "complete",
+]);
 
 export const VersionResponseSchema = z.object({
   ok: z.boolean(),
@@ -78,6 +95,28 @@ export const RuntimePreferencesResponseSchema = z.object({
   workspacePath: z.string().trim().min(1).optional(),
 });
 
+export const PushNotificationIntentSchema = z.enum(["turn_terminal", "action_required"]);
+
+export const PushNotificationPreferencesSchema = z.object({
+  actionRequired: z.boolean(),
+  includeRemainingUsage: z.boolean().default(false),
+  turnTerminal: z.boolean(),
+});
+
+export const RegisterPushNotificationRequestSchema = z.object({
+  expoPushToken: z
+    .string()
+    .trim()
+    .regex(/^(?:Expo|Exponent)PushToken\[[^\]\r\n]{1,512}\]$/),
+  platform: z.enum(["android", "ios"]),
+  preferences: PushNotificationPreferencesSchema,
+});
+
+export const PushNotificationSettingsResponseSchema = z.object({
+  preferences: PushNotificationPreferencesSchema,
+  registered: z.boolean(),
+});
+
 export const CodexModelSchema = z.object({
   id: z.string().min(1),
   model: z.string().min(1),
@@ -86,6 +125,14 @@ export const CodexModelSchema = z.object({
   isDefault: z.boolean().default(false),
   defaultReasoningEffort: ReasoningEffortSchema.optional(),
   supportedReasoningEfforts: z.array(ReasoningEffortSchema).default([]),
+  reasoningEffortOptions: z
+    .array(
+      z.object({
+        reasoningEffort: ReasoningEffortSchema,
+        description: z.string().optional(),
+      }),
+    )
+    .default([]),
   serviceTiers: z
     .array(
       z.object({
@@ -133,10 +180,34 @@ export const RateLimitsResponseSchema = z.object({
   buckets: z.array(RateLimitBucketSchema),
 });
 
+export function rateLimitRemainingPercent(usedPercent: number) {
+  return 100 - Math.max(0, Math.min(100, usedPercent));
+}
+
+export function lowestRateLimitRemainingPercent(buckets: readonly RateLimitBucket[]) {
+  const remaining = buckets.flatMap((bucket) =>
+    [bucket.primary, bucket.secondary].flatMap((window) =>
+      window ? [rateLimitRemainingPercent(window.usedPercent)] : [],
+    ),
+  );
+  return remaining.length > 0 ? Math.min(...remaining) : undefined;
+}
+
 export const ThreadContextWindowResponseSchema = z.object({
   threadId: z.string().min(1),
   usage: ContextWindowUsageSchema.nullable(),
   rolloutPath: z.string().nullable().optional(),
+});
+
+export const ThreadGoalSchema = z.object({
+  threadId: z.string().min(1),
+  objective: z.string().trim().min(1),
+  status: ThreadGoalStatusSchema,
+  tokenBudget: z.number().int().positive().nullable(),
+  tokensUsed: z.number().int().nonnegative(),
+  timeUsedSeconds: z.number().int().nonnegative(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
 });
 
 const PromptAttachmentBaseSchema = z.object({
@@ -227,6 +298,7 @@ export const PendingInputRequestQuestionSchema = z.object({
 
 export const PendingInputRequestSchema = z.object({
   id: z.string().min(1),
+  isBlocking: z.boolean().default(true),
   questions: z.array(PendingInputRequestQuestionSchema),
   threadId: z.string().min(1),
   turnId: z.string().optional(),
@@ -247,6 +319,7 @@ export const ChatMessageSchema = z.object({
 
 export const ThreadSummarySchema = z.object({
   id: z.string().min(1),
+  parentThreadId: z.string().min(1).optional(),
   title: z.string().min(1),
   createdAt: IsoDateTimeSchema,
   updatedAt: IsoDateTimeSchema,
@@ -266,6 +339,7 @@ export const ThreadSummarySchema = z.object({
   lastPrompt: z.string().optional(),
   lastResult: z.string().optional(),
   lastError: z.string().optional(),
+  goal: ThreadGoalSchema.nullable().optional(),
 });
 
 export const StatusResponseSchema = z.object({
@@ -444,6 +518,15 @@ export const WorkspaceTerminalResizeRequestSchema = z.object({
   rows: z.number().int().min(2).max(120),
 });
 
+export const WorkspaceTailscaleServeRequestSchema = z.object({
+  url: z.string().url(),
+});
+
+export const WorkspaceTailscaleServeResponseSchema = z.object({
+  port: z.number().int().positive(),
+  url: z.string().url(),
+});
+
 export const PairRequestSchema = z.object({
   clientSessionId: z.string().trim().min(1).max(120).optional(),
   clientName: z.string().trim().min(1).max(80).optional(),
@@ -567,6 +650,21 @@ export const QueuedThreadInputActionResponseSchema = z.object({
   thread: ThreadSummarySchema,
 });
 
+export const UpdateThreadGoalRequestSchema = z
+  .object({
+    objective: z.string().trim().min(1).optional(),
+    status: ThreadGoalStatusSchema.optional(),
+    tokenBudget: z.number().int().positive().nullable().optional(),
+  })
+  .refine((input) => input.objective || input.status || input.tokenBudget !== undefined, {
+    message: "At least one goal field is required.",
+  });
+
+export const ThreadGoalResponseSchema = z.object({
+  goal: ThreadGoalSchema.nullable(),
+  thread: ThreadSummarySchema,
+});
+
 export const InterruptThreadRunResponseSchema = z.object({
   thread: ThreadSummarySchema,
 });
@@ -596,6 +694,18 @@ export const ArchiveThreadResponseSchema = z.object({
   archivedThreadId: z.string().min(1),
   threads: z.array(ThreadSummarySchema),
   source: z.enum(["app-server", "memory"]).default("memory"),
+});
+
+export const RenameThreadRequestSchema = z.object({
+  title: z.string().trim().min(1).max(120),
+});
+
+export const RenameThreadResponseSchema = z.object({
+  thread: ThreadSummarySchema,
+});
+
+export const RewindThreadRequestSchema = z.object({
+  turnId: z.string().trim().min(1),
 });
 
 export const ListModelsResponseSchema = z.object({
@@ -643,6 +753,11 @@ export const StreamThreadRunEventSchema = z.discriminatedUnion("type", [
     thread: ThreadSummarySchema,
   }),
   z.object({
+    type: z.literal("thread.goal.updated"),
+    thread: ThreadSummarySchema,
+    goal: ThreadGoalSchema.nullable(),
+  }),
+  z.object({
     type: z.literal("thread.error"),
     thread: ThreadSummarySchema.optional(),
     error: ErrorResponseSchema.shape.error,
@@ -669,6 +784,7 @@ export type ChatMessageRole = z.infer<typeof ChatMessageRoleSchema>;
 export type ChatMessageState = z.infer<typeof ChatMessageStateSchema>;
 export type ChatMessageKind = z.infer<typeof ChatMessageKindSchema>;
 export type ApprovalMode = z.infer<typeof ApprovalModeSchema>;
+export type KnownReasoningEffort = z.infer<typeof KnownReasoningEffortSchema>;
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 export type RuntimeMode = z.infer<typeof RuntimeModeSchema>;
 export type SandboxMode = z.infer<typeof SandboxModeSchema>;
@@ -686,11 +802,20 @@ export type RuntimePreferencesByWorkspacePath = z.infer<
   typeof RuntimePreferencesByWorkspacePathSchema
 >;
 export type RuntimePreferencesResponse = z.infer<typeof RuntimePreferencesResponseSchema>;
+export type PushNotificationIntent = z.infer<typeof PushNotificationIntentSchema>;
+export type PushNotificationPreferences = z.infer<typeof PushNotificationPreferencesSchema>;
+export type RegisterPushNotificationRequest = z.infer<typeof RegisterPushNotificationRequestSchema>;
+export type PushNotificationSettingsResponse = z.infer<
+  typeof PushNotificationSettingsResponseSchema
+>;
 export type ContextWindowUsage = z.infer<typeof ContextWindowUsageSchema>;
 export type RateLimitBucket = z.infer<typeof RateLimitBucketSchema>;
 export type RateLimitWindow = z.infer<typeof RateLimitWindowSchema>;
 export type RateLimitsResponse = z.infer<typeof RateLimitsResponseSchema>;
 export type ThreadContextWindowResponse = z.infer<typeof ThreadContextWindowResponseSchema>;
+export type ThreadGoal = z.infer<typeof ThreadGoalSchema>;
+export type ThreadGoalResponse = z.infer<typeof ThreadGoalResponseSchema>;
+export type ThreadGoalStatus = z.infer<typeof ThreadGoalStatusSchema>;
 export type PromptAttachment = z.infer<typeof PromptAttachmentSchema>;
 export type PendingInputRequest = z.infer<typeof PendingInputRequestSchema>;
 export type PendingInputRequestQuestion = z.infer<typeof PendingInputRequestQuestionSchema>;
@@ -719,6 +844,8 @@ export type WorkspaceTerminalSessionResponse = z.infer<
 export type WorkspaceTerminalOutputResponse = z.infer<typeof WorkspaceTerminalOutputResponseSchema>;
 export type WorkspaceTerminalInputRequest = z.infer<typeof WorkspaceTerminalInputRequestSchema>;
 export type WorkspaceTerminalResizeRequest = z.infer<typeof WorkspaceTerminalResizeRequestSchema>;
+export type WorkspaceTailscaleServeRequest = z.infer<typeof WorkspaceTailscaleServeRequestSchema>;
+export type WorkspaceTailscaleServeResponse = z.infer<typeof WorkspaceTailscaleServeResponseSchema>;
 export type WebPreviewTarget = z.infer<typeof WebPreviewTargetSchema>;
 export type PairRequest = z.infer<typeof PairRequestSchema>;
 export type PairResponse = z.infer<typeof PairResponseSchema>;
@@ -734,6 +861,7 @@ export type ImageAttachmentUploadResponse = z.infer<typeof ImageAttachmentUpload
 export type QueuedThreadInput = z.infer<typeof QueuedThreadInputSchema>;
 export type SubmitThreadInputResponse = z.infer<typeof SubmitThreadInputResponseSchema>;
 export type QueuedThreadInputActionResponse = z.infer<typeof QueuedThreadInputActionResponseSchema>;
+export type UpdateThreadGoalRequest = z.infer<typeof UpdateThreadGoalRequestSchema>;
 export type InterruptThreadRunResponse = z.infer<typeof InterruptThreadRunResponseSchema>;
 export type ListQueuedThreadInputsResponse = z.infer<typeof ListQueuedThreadInputsResponseSchema>;
 export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
@@ -743,6 +871,9 @@ export type UpdateRuntimePreferencesRequest = z.infer<typeof UpdateRuntimePrefer
 export type VersionResponse = z.infer<typeof VersionResponseSchema>;
 export type ListThreadsResponse = z.infer<typeof ListThreadsResponseSchema>;
 export type ArchiveThreadResponse = z.infer<typeof ArchiveThreadResponseSchema>;
+export type RenameThreadRequest = z.infer<typeof RenameThreadRequestSchema>;
+export type RenameThreadResponse = z.infer<typeof RenameThreadResponseSchema>;
+export type RewindThreadRequest = z.infer<typeof RewindThreadRequestSchema>;
 export type ListModelsResponse = z.infer<typeof ListModelsResponseSchema>;
 export type ListSkillsResponse = z.infer<typeof ListSkillsResponseSchema>;
 export type ListWorkspaceFilesResponse = z.infer<typeof ListWorkspaceFilesResponseSchema>;
@@ -960,6 +1091,7 @@ export const apiPaths = {
   sessionRefresh: "/v1/session/refresh",
   status: "/v1/status",
   preferences: "/v1/preferences",
+  pushNotifications: "/v1/notifications/push",
   rateLimits: "/v1/rate-limits",
   models: "/v1/models",
   skills: "/v1/skills",
@@ -980,14 +1112,18 @@ export const apiPaths = {
     `/v1/workspace/terminal/sessions/${encodeURIComponent(sessionId)}/output/stream`,
   workspaceTerminalResize: (sessionId: string) =>
     `/v1/workspace/terminal/sessions/${encodeURIComponent(sessionId)}/resize`,
+  workspaceTailscaleServe: "/v1/workspace/tailscale/serve",
   imageAttachments: "/v1/attachments/images",
   imageAttachment: (attachmentId: string) =>
     `/v1/attachments/images/${encodeURIComponent(attachmentId)}`,
   threads: "/v1/threads",
   thread: (threadId: string) => `/v1/threads/${encodeURIComponent(threadId)}`,
   threadArchive: (threadId: string) => `/v1/threads/${encodeURIComponent(threadId)}`,
+  threadName: (threadId: string) => `/v1/threads/${encodeURIComponent(threadId)}/name`,
+  threadRollback: (threadId: string) => `/v1/threads/${encodeURIComponent(threadId)}/rollback`,
   threadContextWindow: (threadId: string) =>
     `/v1/threads/${encodeURIComponent(threadId)}/context-window`,
+  threadGoal: (threadId: string) => `/v1/threads/${encodeURIComponent(threadId)}/goal`,
   threadMessageDetail: (threadId: string, messageId: string, field: ThreadMessageDetailField) =>
     `/v1/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(messageId)}/details/${encodeURIComponent(field)}`,
   approval: (approvalId: string) => `/v1/approvals/${encodeURIComponent(approvalId)}`,
@@ -1007,7 +1143,7 @@ export function createOpenApiDocument() {
     openapi: "3.1.0",
     info: {
       title: "Codex Relay Local Codex API",
-      version: "0.1.0",
+      version: "1.2.0",
     },
     paths: {
       "/version": {
@@ -1033,6 +1169,31 @@ export function createOpenApiDocument() {
           responses: {
             "200": jsonResponse("RuntimePreferencesResponse"),
             "400": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
+      "/v1/notifications/push": {
+        get: {
+          summary: "Read push notification settings for this paired device",
+          responses: {
+            "200": jsonResponse("PushNotificationSettingsResponse"),
+            "401": jsonResponse("ErrorResponse"),
+          },
+        },
+        put: {
+          summary: "Register push notifications for this paired device",
+          requestBody: jsonRequest("RegisterPushNotificationRequest"),
+          responses: {
+            "200": jsonResponse("PushNotificationSettingsResponse"),
+            "400": jsonResponse("ErrorResponse"),
+            "401": jsonResponse("ErrorResponse"),
+          },
+        },
+        delete: {
+          summary: "Remove push notifications for this paired device",
+          responses: {
+            "200": jsonResponse("PushNotificationSettingsResponse"),
+            "401": jsonResponse("ErrorResponse"),
           },
         },
       },
@@ -1062,6 +1223,11 @@ export function createOpenApiDocument() {
               required: true,
               schema: { type: "string" },
             },
+            {
+              name: "refresh",
+              in: "query",
+              schema: { type: "boolean" },
+            },
           ],
           responses: {
             "200": jsonResponse("ThreadDetailResponse"),
@@ -1081,6 +1247,48 @@ export function createOpenApiDocument() {
           responses: {
             "200": jsonResponse("ArchiveThreadResponse"),
             "404": jsonResponse("ErrorResponse"),
+            "502": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
+      "/v1/threads/{threadId}/name": {
+        post: {
+          summary: "Rename a Codex app-server thread",
+          parameters: [
+            {
+              name: "threadId",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+          ],
+          requestBody: jsonRequest("RenameThreadRequest"),
+          responses: {
+            "200": jsonResponse("RenameThreadResponse"),
+            "400": jsonResponse("ErrorResponse"),
+            "404": jsonResponse("ErrorResponse"),
+            "409": jsonResponse("ErrorResponse"),
+            "502": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
+      "/v1/threads/{threadId}/rollback": {
+        post: {
+          summary: "Rewind a Codex app-server thread to before a selected turn",
+          parameters: [
+            {
+              name: "threadId",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+          ],
+          requestBody: jsonRequest("RewindThreadRequest"),
+          responses: {
+            "200": jsonResponse("ThreadDetailResponse"),
+            "400": jsonResponse("ErrorResponse"),
+            "404": jsonResponse("ErrorResponse"),
+            "409": jsonResponse("ErrorResponse"),
             "502": jsonResponse("ErrorResponse"),
           },
         },
@@ -1125,6 +1333,17 @@ export function createOpenApiDocument() {
           },
         },
       },
+      "/v1/workspace/tailscale/serve": {
+        post: {
+          summary: "Start Tailscale Serve for a workspace preview URL",
+          requestBody: jsonRequest("WorkspaceTailscaleServeRequest"),
+          responses: {
+            "200": jsonResponse("WorkspaceTailscaleServeResponse"),
+            "400": jsonResponse("ErrorResponse"),
+            "502": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
       "/v1/threads/{threadId}/runs": {
         post: {
           summary: "Run a prompt on a Codex thread",
@@ -1159,6 +1378,36 @@ export function createOpenApiDocument() {
             "200": jsonResponse("InterruptThreadRunResponse"),
             "404": jsonResponse("ErrorResponse"),
             "409": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
+      "/v1/threads/{threadId}/goal": {
+        get: {
+          summary: "Read the active goal for a Codex app-server thread",
+          responses: {
+            "200": jsonResponse("ThreadGoalResponse"),
+            "404": jsonResponse("ErrorResponse"),
+            "502": jsonResponse("ErrorResponse"),
+          },
+        },
+        post: {
+          summary: "Update the active goal for a Codex app-server thread",
+          requestBody: jsonRequest("UpdateThreadGoalRequest"),
+          responses: {
+            "200": jsonResponse("ThreadGoalResponse"),
+            "400": jsonResponse("ErrorResponse"),
+            "404": jsonResponse("ErrorResponse"),
+            "409": jsonResponse("ErrorResponse"),
+            "502": jsonResponse("ErrorResponse"),
+          },
+        },
+        delete: {
+          summary: "Clear the active goal for a Codex app-server thread",
+          responses: {
+            "200": jsonResponse("ThreadGoalResponse"),
+            "404": jsonResponse("ErrorResponse"),
+            "409": jsonResponse("ErrorResponse"),
+            "502": jsonResponse("ErrorResponse"),
           },
         },
       },
@@ -1203,6 +1452,7 @@ export function createOpenApiDocument() {
     components: {
       schemas: {
         ThreadState: { type: "string", enum: ThreadStateSchema.options },
+        ReasoningEffort: { type: "string", minLength: 1 },
         ChatMessage: {
           type: "object",
           required: ["id", "threadId", "role", "content", "createdAt"],
@@ -1245,6 +1495,71 @@ export function createOpenApiDocument() {
             lastPrompt: { type: "string" },
             lastResult: { type: "string" },
             lastError: { type: "string" },
+            goal: {
+              anyOf: [{ $ref: "#/components/schemas/ThreadGoal" }, { type: "null" }],
+            },
+          },
+        },
+        ThreadGoal: {
+          type: "object",
+          required: [
+            "threadId",
+            "objective",
+            "status",
+            "tokenBudget",
+            "tokensUsed",
+            "timeUsedSeconds",
+            "createdAt",
+            "updatedAt",
+          ],
+          properties: {
+            threadId: { type: "string" },
+            objective: { type: "string" },
+            status: { type: "string", enum: ThreadGoalStatusSchema.options },
+            tokenBudget: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
+            tokensUsed: { type: "integer", minimum: 0 },
+            timeUsedSeconds: { type: "integer", minimum: 0 },
+            createdAt: { type: "string", format: "date-time" },
+            updatedAt: { type: "string", format: "date-time" },
+          },
+        },
+        UpdateThreadGoalRequest: {
+          type: "object",
+          properties: {
+            objective: { type: "string" },
+            status: { type: "string", enum: ThreadGoalStatusSchema.options },
+            tokenBudget: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
+          },
+        },
+        RenameThreadRequest: {
+          type: "object",
+          required: ["title"],
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 120 },
+          },
+        },
+        RenameThreadResponse: {
+          type: "object",
+          required: ["thread"],
+          properties: {
+            thread: { $ref: "#/components/schemas/ThreadSummary" },
+          },
+        },
+        RewindThreadRequest: {
+          type: "object",
+          required: ["turnId"],
+          properties: {
+            turnId: { type: "string", minLength: 1 },
+          },
+        },
+        ThreadGoalResponse: {
+          type: "object",
+          required: ["goal", "thread"],
+          properties: {
+            goal: {
+              anyOf: [{ $ref: "#/components/schemas/ThreadGoal" }, { type: "null" }],
+            },
+            thread: { $ref: "#/components/schemas/ThreadSummary" },
           },
         },
         StatusResponse: {
@@ -1295,7 +1610,7 @@ export function createOpenApiDocument() {
             },
             reasoningEffort: {
               type: "string",
-              enum: ["minimal", "low", "medium", "high", "xhigh"],
+              minLength: 1,
             },
           },
         },
@@ -1312,7 +1627,7 @@ export function createOpenApiDocument() {
             },
             reasoningEffort: {
               type: "string",
-              enum: ["minimal", "low", "medium", "high", "xhigh"],
+              minLength: 1,
               nullable: true,
             },
           },
@@ -1328,6 +1643,35 @@ export function createOpenApiDocument() {
             },
             threadId: { type: "string" },
             workspacePath: { type: "string" },
+          },
+        },
+        PushNotificationPreferences: {
+          type: "object",
+          required: ["actionRequired", "turnTerminal"],
+          properties: {
+            actionRequired: { type: "boolean" },
+            includeRemainingUsage: { type: "boolean", default: false },
+            turnTerminal: { type: "boolean" },
+          },
+        },
+        RegisterPushNotificationRequest: {
+          type: "object",
+          required: ["expoPushToken", "platform", "preferences"],
+          properties: {
+            expoPushToken: {
+              type: "string",
+              pattern: "^(?:Expo|Exponent)PushToken\\[[^\\]\\r\\n]{1,512}\\]$",
+            },
+            platform: { type: "string", enum: ["android", "ios"] },
+            preferences: { $ref: "#/components/schemas/PushNotificationPreferences" },
+          },
+        },
+        PushNotificationSettingsResponse: {
+          type: "object",
+          required: ["preferences", "registered"],
+          properties: {
+            preferences: { $ref: "#/components/schemas/PushNotificationPreferences" },
+            registered: { type: "boolean" },
           },
         },
         WorkspaceDirectoryEntry: {
@@ -1407,6 +1751,21 @@ export function createOpenApiDocument() {
             content: { type: "string", maxLength: 1048576 },
             path: { type: "string" },
             workspacePath: { type: "string" },
+          },
+        },
+        WorkspaceTailscaleServeRequest: {
+          type: "object",
+          required: ["url"],
+          properties: {
+            url: { type: "string", format: "uri" },
+          },
+        },
+        WorkspaceTailscaleServeResponse: {
+          type: "object",
+          required: ["url", "port"],
+          properties: {
+            url: { type: "string", format: "uri" },
+            port: { type: "integer", minimum: 1 },
           },
         },
         CreateThreadRequest: {

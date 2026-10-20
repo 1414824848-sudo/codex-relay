@@ -6,6 +6,8 @@ import type {
   ListQueuedThreadInputsResponse,
   ListThreadsResponse,
   QueuedThreadInput,
+  RenameThreadRequest,
+  RewindThreadRequest,
   RunThreadRequest,
   RuntimePreferences,
   RuntimePreferencesResponse,
@@ -13,19 +15,18 @@ import type {
   StreamThreadRunEvent,
   ThreadDetailResponse,
   ThreadSummary,
+  UpdateThreadGoalRequest,
   VersionResponse,
-} from "codex-relay/api-schema";
-import {
-  chatMessageDetailsFromPromptContext,
-  promptMarkdownWithSkills,
 } from "codex-relay/api-schema";
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
 
 import {
   archiveThread,
   checkoutWorkspaceBranch,
+  clearThreadGoal,
   commitPushWorkspace,
   createThread,
+  getThreadGoal,
   getCodexRelayServerUrl,
   getRateLimits,
   getStatus,
@@ -38,18 +39,26 @@ import {
   listThreads,
   listWorkspaceDirectories,
   removeQueuedThreadInput,
+  renameThread,
+  rewindThread,
   steerQueuedThreadInput,
   submitThreadInput,
+  updateThreadGoal,
   updateRuntimePreferences,
 } from "@/lib/codex-relay-api";
 import {
   cacheWorkspaceRuntimePreferences,
   cacheWorkspaceRuntimePreferencesFromStatus,
 } from "@/lib/workspace-runtime-preferences-cache";
+import {
+  appendOptimisticSteeringMessageToDetail,
+  mergeThreadDetailState,
+  preferredThreadSnapshot,
+  upsertMessage,
+} from "./server-state-messages";
 
 const rootKey = "codex-relay-server-state";
 const persistableServerStateScopes = new Set(["models", "status", "threads"]);
-const optimisticSteeringMessageIdPrefix = "optimistic-steering:";
 
 export const serverStateKeys = {
   all: () => [rootKey, getCodexRelayServerUrl()] as const,
@@ -102,18 +111,36 @@ export function fetchRateLimitsState(queryClient: QueryClient) {
   });
 }
 
-export function fetchThreadState(queryClient: QueryClient, threadId: string) {
-  return queryClient
-    .fetchQuery({
-      queryKey: serverStateKeys.thread(threadId),
-      queryFn: () => getThread(threadId),
-    })
-    .then((response) => {
-      queryClient.setQueryData<ThreadDetailResponse>(serverStateKeys.thread(threadId), (current) =>
-        mergeThreadDetailState(current, response),
-      );
-      return response;
-    });
+export async function fetchThreadState(
+  queryClient: QueryClient,
+  threadId: string,
+  options: { refresh?: boolean } = {},
+) {
+  if (options.refresh) {
+    const response = await getThread(threadId, { refresh: true });
+    setThreadDetailState(
+      queryClient,
+      response.thread,
+      response.messages,
+      response.pendingInputRequests,
+      { replaceMessages: true },
+    );
+    return response;
+  }
+  return queryClient.fetchQuery({
+    queryKey: serverStateKeys.thread(threadId),
+    queryFn: () => fetchThreadQueryState(queryClient, threadId),
+  });
+}
+
+export async function fetchThreadQueryState(queryClient: QueryClient, threadId: string) {
+  const response = await getThread(threadId);
+  const merged = mergeThreadDetailState(
+    queryClient.getQueryData<ThreadDetailResponse>(serverStateKeys.thread(threadId)),
+    response,
+  );
+  upsertThreadState(queryClient, merged.thread);
+  return merged;
 }
 
 export function fetchQueuedInputsState(queryClient: QueryClient, threadId: string) {
@@ -128,6 +155,12 @@ export function fetchContextWindowState(queryClient: QueryClient, threadId: stri
     queryKey: serverStateKeys.contextWindow(threadId),
     queryFn: () => getThreadContextWindow(threadId),
   });
+}
+
+export async function fetchThreadGoalState(queryClient: QueryClient, threadId: string) {
+  const response = await getThreadGoal(threadId);
+  upsertThreadState(queryClient, response.thread);
+  return response;
 }
 
 export function fetchWorkspaceChangesState(
@@ -172,6 +205,33 @@ export async function archiveThreadServerState(queryClient: QueryClient, threadI
   const response = await archiveThread(threadId);
   setThreadsState(queryClient, response.threads, response.source);
   removeThreadDetailState(queryClient, response.archivedThreadId);
+  return response;
+}
+
+export async function renameThreadServerState(
+  queryClient: QueryClient,
+  threadId: string,
+  body: RenameThreadRequest,
+) {
+  const response = await renameThread(threadId, body);
+  upsertThreadState(queryClient, response.thread);
+  return response;
+}
+
+export async function rewindThreadServerState(
+  queryClient: QueryClient,
+  threadId: string,
+  body: RewindThreadRequest,
+) {
+  const response = await rewindThread(threadId, body);
+  setThreadDetailState(
+    queryClient,
+    response.thread,
+    response.messages,
+    response.pendingInputRequests,
+    { replaceMessages: true },
+  );
+  setQueuedInputsState(queryClient, threadId, []);
   return response;
 }
 
@@ -233,6 +293,22 @@ export function updateRuntimePreferencesServerState(
   body: Parameters<typeof updateRuntimePreferences>[0],
 ) {
   return updateRuntimePreferences(body);
+}
+
+export async function updateThreadGoalServerState(
+  queryClient: QueryClient,
+  threadId: string,
+  body: UpdateThreadGoalRequest,
+) {
+  const response = await updateThreadGoal(threadId, body);
+  upsertThreadState(queryClient, response.thread);
+  return response;
+}
+
+export async function clearThreadGoalServerState(queryClient: QueryClient, threadId: string) {
+  const response = await clearThreadGoal(threadId);
+  upsertThreadState(queryClient, response.thread);
+  return response;
 }
 
 export function clearServerState(queryClient: QueryClient) {
@@ -340,13 +416,16 @@ export function setThreadsState(
 export function upsertThreadState(queryClient: QueryClient, thread: ThreadSummary) {
   queryClient.setQueryData<ListThreadsResponse>(serverStateKeys.threads(), (current) => {
     const threads = current?.threads ?? [];
+    const existing = threads.find((candidate) => candidate.id === thread.id);
     return {
       source: current?.source ?? "memory",
-      threads: sortThreads(upsertById(threads, thread)),
+      threads: sortThreads(
+        upsertById(threads, existing ? preferredThreadSnapshot(existing, thread) : thread),
+      ),
     };
   });
   queryClient.setQueryData<ThreadDetailResponse>(serverStateKeys.thread(thread.id), (current) =>
-    current ? { ...current, thread } : current,
+    current ? { ...current, thread: preferredThreadSnapshot(current.thread, thread) } : current,
   );
 }
 
@@ -355,6 +434,7 @@ export function setThreadDetailState(
   thread: ThreadSummary,
   messages: ChatMessage[],
   pendingInputRequests: ThreadDetailResponse["pendingInputRequests"] = [],
+  options: { replaceMessages?: boolean } = {},
 ) {
   upsertThreadState(queryClient, thread);
   const response: ThreadDetailResponse = {
@@ -363,7 +443,7 @@ export function setThreadDetailState(
     pendingInputRequests,
   };
   queryClient.setQueryData<ThreadDetailResponse>(serverStateKeys.thread(thread.id), (current) =>
-    mergeThreadDetailState(current, response),
+    options.replaceMessages ? response : mergeThreadDetailState(current, response),
   );
 }
 
@@ -481,6 +561,7 @@ export function removeQueuedInputState(
 }
 
 export type OptimisticSteerQueuedInputSnapshot = {
+  hadThreadDetail: boolean;
   queuedInputs?: ListQueuedThreadInputsResponse;
   threadDetail?: ThreadDetailResponse;
   threads?: ListThreadsResponse;
@@ -496,6 +577,11 @@ export async function optimisticallySteerQueuedInputState(
     queryClient.cancelQueries({ queryKey: serverStateKeys.thread(threadId) }),
   ]);
   const snapshot: OptimisticSteerQueuedInputSnapshot = {
+    hadThreadDetail: queryClient.getQueryData<ThreadDetailResponse>(
+      serverStateKeys.thread(threadId),
+    )
+      ? true
+      : false,
     queuedInputs: queryClient.getQueryData<ListQueuedThreadInputsResponse>(
       serverStateKeys.queuedInputs(threadId),
     ),
@@ -521,6 +607,8 @@ export function restoreOptimisticSteerQueuedInputState(
   }
   if (snapshot.threadDetail) {
     queryClient.setQueryData(serverStateKeys.thread(threadId), snapshot.threadDetail);
+  } else if (!snapshot.hadThreadDetail) {
+    queryClient.removeQueries({ queryKey: serverStateKeys.thread(threadId) });
   }
   if (snapshot.threads) {
     queryClient.setQueryData(serverStateKeys.threads(), snapshot.threads);
@@ -544,6 +632,9 @@ export function applyStreamEventToServerState(
       upsertMessageState(queryClient, event.thread, event.message);
       return;
     case "thread.state.changed":
+      upsertThreadState(queryClient, event.thread);
+      return;
+    case "thread.goal.updated":
       upsertThreadState(queryClient, event.thread);
       return;
     case "thread.error":
@@ -610,130 +701,25 @@ function appendOptimisticSteeringMessageState(
   input: QueuedThreadInput,
 ) {
   queryClient.setQueryData<ThreadDetailResponse>(serverStateKeys.thread(threadId), (current) => {
-    if (!current) {
-      return current;
-    }
-    const message: ChatMessage = {
-      id: optimisticSteeringMessageId(input.id),
+    return appendOptimisticSteeringMessageToDetail(current, {
+      input,
+      nowIso: new Date().toISOString(),
+      thread: optimisticSteeringThread(queryClient, threadId),
       threadId,
-      role: "user",
-      kind: "chat",
-      content: promptMarkdownWithSkills(input.prompt, input.skills),
-      createdAt: new Date().toISOString(),
-      details: chatMessageDetailsFromPromptContext(input, { optimisticQueuedInputId: input.id }),
-      state: "completed",
-    };
-    return {
-      ...current,
-      messages: upsertMessage(current.messages, message),
-    };
+    });
   });
 }
 
-function optimisticSteeringMessageId(inputId: string) {
-  return `${optimisticSteeringMessageIdPrefix}${inputId}`;
-}
-
-function mergeThreadDetailState(
-  current: ThreadDetailResponse | undefined,
-  response: ThreadDetailResponse,
-) {
-  if (!current || current.thread.id !== response.thread.id || current.messages.length === 0) {
-    return response;
-  }
-  const messages = mergeMessages(current.messages, response.messages);
-  return {
-    ...response,
-    messages,
-  };
-}
-
-function mergeMessages(baseMessages: ChatMessage[], incomingMessages: ChatMessage[]) {
-  const incomingById = new Map(incomingMessages.map((message) => [message.id, message]));
-  const indexesById = new Map<string, number>();
-  const seenIds = new Set<string>();
-  const messages: ChatMessage[] = [];
-  for (const candidate of [...baseMessages, ...incomingMessages]) {
-    const message = incomingById.get(candidate.id) ?? candidate;
-    if (seenIds.has(message.id)) {
-      continue;
-    }
-    const replacementId = replacementMessageId(message);
-    if (replacementId) {
-      const replacementIndex = indexesById.get(replacementId);
-      if (replacementIndex !== undefined) {
-        messages[replacementIndex] = message;
-        seenIds.delete(replacementId);
-        seenIds.add(message.id);
-        indexesById.delete(replacementId);
-        indexesById.set(message.id, replacementIndex);
-        continue;
-      }
-    }
-    const lastMessage = messages[messages.length - 1];
-    if (isDuplicateOptimisticQueuedMessage(lastMessage, message)) {
-      messages[messages.length - 1] = message;
-      seenIds.delete(lastMessage.id);
-      seenIds.add(message.id);
-      indexesById.delete(lastMessage.id);
-      indexesById.set(message.id, messages.length - 1);
-      continue;
-    }
-    seenIds.add(message.id);
-    indexesById.set(message.id, messages.length);
-    messages.push(message);
-  }
-  return messages;
-}
-
-function upsertMessage(messages: ChatMessage[], message: ChatMessage) {
-  const existingIndex = messages.findIndex((candidate) => candidate.id === message.id);
-  if (existingIndex !== -1) {
-    return messages.map((candidate) => (candidate.id === message.id ? message : candidate));
-  }
-  const replacementId = replacementMessageId(message);
-  const replacementIndex = replacementId
-    ? messages.findIndex((candidate) => candidate.id === replacementId)
-    : -1;
-  if (replacementIndex !== -1) {
-    return messages.map((candidate, index) => (index === replacementIndex ? message : candidate));
-  }
-  const optimisticIndex =
-    message.role === "user"
-      ? messages.findIndex(
-          (candidate) =>
-            candidate.id.startsWith(optimisticSteeringMessageIdPrefix) &&
-            candidate.role === "user" &&
-            candidate.content === message.content,
-        )
-      : -1;
-  if (optimisticIndex !== -1) {
-    return messages.map((candidate, index) => (index === optimisticIndex ? message : candidate));
-  }
-  const lastMessage = messages[messages.length - 1];
-  if (isDuplicateOptimisticQueuedMessage(lastMessage, message)) {
-    return messages.map((candidate, index) =>
-      index === messages.length - 1 ? message : candidate,
-    );
-  }
-  return [...messages, message];
-}
-
-function isDuplicateOptimisticQueuedMessage(
-  previous: ChatMessage | undefined,
-  incoming: ChatMessage,
-) {
+function optimisticSteeringThread(queryClient: QueryClient, threadId: string) {
+  const detailThread = queryClient.getQueryData<ThreadDetailResponse>(
+    serverStateKeys.thread(threadId),
+  )?.thread;
   return (
-    previous?.id.startsWith(optimisticSteeringMessageIdPrefix) === true &&
-    previous.threadId === incoming.threadId &&
-    previous.role === incoming.role &&
-    previous.content === incoming.content
+    detailThread ??
+    queryClient
+      .getQueryData<ListThreadsResponse>(serverStateKeys.threads())
+      ?.threads.find((thread) => thread.id === threadId)
   );
-}
-
-function replacementMessageId(message: ChatMessage) {
-  const replacementId = message.details?.replacesMessageId;
-  return typeof replacementId === "string" && replacementId.length > 0 ? replacementId : undefined;
 }
 
 function appendMessageDeltaState(
@@ -750,12 +736,14 @@ function appendMessageDeltaState(
       ...current,
       messages: current.messages.map((message) =>
         message.id === messageId
-          ? {
-              ...message,
-              content: `${message.content}${normalizeStreamDelta(message.content, delta)}`,
-              state: "streaming",
-              updatedAt: new Date().toISOString(),
-            }
+          ? message.state === "completed"
+            ? message
+            : {
+                ...message,
+                content: `${message.content}${normalizeStreamDelta(message.content, delta)}`,
+                state: "streaming",
+                updatedAt: new Date().toISOString(),
+              }
           : message,
       ),
     };

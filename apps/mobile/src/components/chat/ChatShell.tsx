@@ -5,10 +5,10 @@ import type {
   PendingInputRequest,
   RateLimitBucket,
   ThreadCollaborationMode,
+  ThreadGoal,
 } from "codex-relay/api-schema";
 import { useCallback, useMemo, useState, type ReactNode } from "react";
-import { Keyboard, Pressable, View } from "react-native";
-import { StyleSheet } from "react-native-unistyles";
+import { Keyboard, View } from "react-native";
 import {
   KeyboardController,
   KeyboardGestureArea,
@@ -16,23 +16,17 @@ import {
 } from "react-native-keyboard-controller";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
-import { Icon, type AppIconName } from "@/components/ui/icon";
-import { Colors, MaxContentWidth, Spacing } from "@/constants/theme";
-import { hapticSelection } from "@/lib/haptics";
+import { Spacing } from "@/constants/theme";
 import type { QueuedComposerPrompt } from "@/state/chat-store";
 
 import { ChatComposer } from "./ChatComposer";
+import { ChatShellHeader, type ChatShellAction } from "./ChatShellHeader";
+import { chatShellStyles as styles } from "./chat-shell-styles";
 import { implementablePlanId, MessageTimeline } from "./MessageTimeline";
+import { PlanProgressBanner } from "./PlanProgressBanner";
+import { splitTimelinePlanProgress } from "./plan-progress";
 import type { WorkspaceMarkdownPreviewTarget } from "./workspace-preview/markdown-target";
-
-export type ChatShellAction = {
-  disabled?: boolean;
-  icon: AppIconName;
-  label: string;
-  onPress: () => void;
-};
 
 export function ChatShell({
   banner,
@@ -44,6 +38,8 @@ export function ChatShell({
   composerInputEditable,
   contextWindowUsage,
   collaborationMode,
+  goal,
+  horizontalSafeArea = true,
   inputNativeID,
   isAttachingImage,
   isLoadingMessages,
@@ -58,12 +54,16 @@ export function ChatShell({
   onIgnoreInputRequest,
   onOpenMarkdownAttachment,
   onMessageCopied,
+  onMessageRewind,
   onRefreshUsageStatus,
   onSubmitInputRequest,
   onRemoveQueuedPrompt,
   onRestoreQueuedPrompt,
   onSend,
   onSteerQueuedPrompt,
+  onClearGoal,
+  onSaveGoal,
+  onToggleGoalPause,
   queuedPrompts,
   rateLimitBuckets,
   pendingInputRequest,
@@ -84,6 +84,8 @@ export function ChatShell({
   composerInputEditable?: boolean;
   contextWindowUsage?: ContextWindowUsage;
   collaborationMode: ThreadCollaborationMode;
+  goal?: ThreadGoal | null;
+  horizontalSafeArea?: boolean;
   inputNativeID: string;
   isAttachingImage: boolean;
   isLoadingMessages?: boolean;
@@ -97,6 +99,7 @@ export function ChatShell({
   onImplementPlan?: () => void;
   onIgnoreInputRequest?: (request: PendingInputRequest) => void;
   onMessageCopied?: () => void;
+  onMessageRewind?: (message: ChatMessage) => void;
   onOpenMarkdownAttachment?: (target: WorkspaceMarkdownPreviewTarget) => void;
   onRefreshUsageStatus?: () => Promise<void> | void;
   onSubmitInputRequest?: (request: PendingInputRequest, answers: string[]) => void;
@@ -104,6 +107,9 @@ export function ChatShell({
   onRestoreQueuedPrompt?: (item: QueuedComposerPrompt) => void;
   onSend: () => void;
   onSteerQueuedPrompt?: (item: QueuedComposerPrompt) => void;
+  onClearGoal?: () => void;
+  onSaveGoal?: (objective: string) => void;
+  onToggleGoalPause?: () => void;
   queuedPrompts: QueuedComposerPrompt[];
   rateLimitBuckets: RateLimitBucket[];
   pendingInputRequest?: PendingInputRequest;
@@ -118,6 +124,11 @@ export function ChatShell({
   const insets = useSafeAreaInsets();
   const [isKeyboardLayoutFrozen, setKeyboardLayoutFrozen] = useState(false);
   const [queuedPromptPanelHeight, setQueuedPromptPanelHeight] = useState(0);
+  const {
+    progress: planProgress,
+    subagents: planSubagents,
+    visibleMessages,
+  } = useMemo(() => splitTimelinePlanProgress(messages, isRunning), [isRunning, messages]);
   const implementablePlanMessageId = useMemo(
     () => (!isRunning ? implementablePlanId(messages) : undefined),
     [isRunning, messages],
@@ -134,34 +145,21 @@ export function ChatShell({
   return (
     <ThemedView style={styles.container}>
       <SafeAreaView
-        edges={["top", "left", "right"]}
+        edges={horizontalSafeArea ? ["top", "left", "right"] : ["top"]}
         style={[
           styles.safeArea,
           { paddingBottom: Math.max(Spacing.one, insets.bottom - Spacing.four) },
         ]}
       >
         <View style={styles.shell}>
-          <View pointerEvents="box-none" style={styles.header}>
-            <HeaderButton action={leadingAction} />
-            <View pointerEvents="none" style={styles.titleGroup}>
-              <ThemedText type="smallBold" style={styles.title} numberOfLines={1}>
-                {title}
-              </ThemedText>
-              <ThemedText
-                type="code"
-                themeColor="textSecondary"
-                style={styles.subtitle}
-                numberOfLines={1}
-              >
-                {subtitle}
-              </ThemedText>
-            </View>
-            <View pointerEvents="box-none" style={styles.headerActions}>
-              {trailingActions.map((action) => (
-                <HeaderButton key={action.label} action={action} />
-              ))}
-            </View>
-          </View>
+          <ChatShellHeader
+            leadingAction={leadingAction}
+            subtitle={subtitle}
+            title={title}
+            trailingActions={trailingActions}
+          />
+
+          <PlanProgressBanner progress={planProgress} subagents={planSubagents} />
 
           {banner}
 
@@ -175,8 +173,9 @@ export function ChatShell({
                 isLoading={isLoadingMessages}
                 isRunning={isRunning}
                 keyboardLayoutFrozen={isKeyboardLayoutFrozen}
-                messages={messages}
+                messages={visibleMessages}
                 onMessageCopied={onMessageCopied}
+                onMessageRewind={onMessageRewind}
                 onOpenMarkdownAttachment={onOpenMarkdownAttachment}
                 onKeyboardDismissRequest={handleTimelineKeyboardDismissRequest}
                 bottomAccessoryHeight={queuedPromptPanelHeight}
@@ -189,6 +188,7 @@ export function ChatShell({
                 collaborationMode={collaborationMode}
                 composerThreadId={threadId}
                 contextWindowUsage={contextWindowUsage}
+                goal={goal}
                 disabled={composerDisabled}
                 disabledPlaceholder={composerDisabledPlaceholder}
                 inputEditable={composerInputEditable}
@@ -210,6 +210,9 @@ export function ChatShell({
                 onRestoreQueuedPrompt={onRestoreQueuedPrompt}
                 onSend={onSend}
                 onSteerQueuedPrompt={onSteerQueuedPrompt}
+                onClearGoal={onClearGoal}
+                onSaveGoal={onSaveGoal}
+                onToggleGoalPause={onToggleGoalPause}
                 onQueuedPromptPanelHeightChange={handleQueuedPromptPanelHeightChange}
                 planConfirmationId={implementablePlanMessageId}
                 pendingInputRequest={pendingInputRequest}
@@ -227,110 +230,3 @@ export function ChatShell({
     </ThemedView>
   );
 }
-
-function HeaderButton({ action }: { action: ChatShellAction }) {
-  return (
-    <Pressable
-      accessibilityLabel={action.label}
-      accessibilityRole="button"
-      disabled={action.disabled}
-      hitSlop={8}
-      onPress={action.onPress}
-      onPressIn={action.disabled ? undefined : hapticSelection}
-      pressRetentionOffset={12}
-      style={({ pressed }) => [
-        styles.headerButton,
-        action.disabled && styles.headerButtonDisabled,
-        pressed && styles.pressed,
-      ]}
-    >
-      <Icon name={action.icon} size={17} tintColor={Colors.dark.text} />
-    </Pressable>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: {
-    backgroundColor: Colors.dark.background,
-    flex: 1,
-    flexDirection: "row",
-    justifyContent: "center",
-  },
-  safeArea: {
-    flex: 1,
-    maxWidth: MaxContentWidth,
-  },
-  shell: {
-    backgroundColor: Colors.dark.background,
-    flex: 1,
-    gap: 0,
-    paddingTop: Spacing.one,
-  },
-  header: {
-    alignItems: "center",
-    elevation: 4,
-    flexDirection: "row",
-    gap: 10,
-    paddingBottom: 8,
-    paddingHorizontal: 18,
-    paddingTop: 6,
-    zIndex: 4,
-  },
-  headerActions: {
-    elevation: 6,
-    flexDirection: "row",
-    flexShrink: 0,
-    gap: 10,
-    zIndex: 6,
-  },
-  headerButton: {
-    alignItems: "center",
-    backgroundColor: "rgba(42, 42, 42, 0.8)",
-    borderColor: "rgba(255, 255, 255, 0.08)",
-    borderRadius: 18,
-    borderWidth: 1,
-    height: 36,
-    justifyContent: "center",
-    position: "relative",
-    width: 36,
-    zIndex: 7,
-  },
-  headerButtonDisabled: {
-    opacity: 0.45,
-  },
-  titleGroup: {
-    alignItems: "center",
-    flex: 1,
-    flexShrink: 1,
-    minWidth: 0,
-  },
-  title: {
-    fontSize: 17,
-    lineHeight: 22,
-    textAlign: "center",
-  },
-  subtitle: {
-    fontSize: 10,
-    lineHeight: 14,
-    maxWidth: "100%",
-    opacity: 0.84,
-    textAlign: "center",
-  },
-  timeline: {
-    flex: 1,
-    minHeight: 0,
-  },
-  chatBody: {
-    flex: 1,
-    minHeight: 0,
-  },
-  composerDock: {
-    elevation: 8,
-    flexShrink: 0,
-    position: "relative",
-    zIndex: 8,
-  },
-  pressed: {
-    opacity: 0.7,
-  },
-});

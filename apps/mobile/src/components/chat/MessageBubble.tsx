@@ -31,6 +31,11 @@ import { hapticSelection } from "@/lib/haptics";
 
 import { PromptMarkdownText } from "./PromptMarkdownText";
 import { ProtocolActivityCard } from "./ProtocolActivityCard";
+import { messageSegmentRenderKey } from "./message-segment-key";
+import {
+  messageCodeContentForRender,
+  messageMarkdownContentForRender,
+} from "./message-markdown-content";
 import type { WorkspaceMarkdownPreviewTarget } from "./workspace-preview/markdown-target";
 
 const DATA_URI_PATTERN = /data:[^;\s]+;base64,[A-Za-z0-9+/=\n\r]+/g;
@@ -109,10 +114,12 @@ type MarkdownSegment =
 export const MessageBubble = memo(function MessageBubble({
   message,
   onMessageCopied,
+  onMessageRewind,
   onOpenMarkdownAttachment,
 }: {
   message: ChatMessage;
   onMessageCopied?: () => void;
+  onMessageRewind?: (message: ChatMessage) => void;
   onOpenMarkdownAttachment?: (target: WorkspaceMarkdownPreviewTarget) => void;
 }) {
   const theme = useTheme();
@@ -315,6 +322,9 @@ export const MessageBubble = memo(function MessageBubble({
             canCopy={copyMarkdown.length > 0}
             isCopied={isCopied}
             onCopyPress={handleCopyPress}
+            onRewindPress={
+              onMessageRewind && message.turnId ? () => onMessageRewind(message) : undefined
+            }
             timestamp={timestamp}
             variant="user"
           />
@@ -338,10 +348,10 @@ export const MessageBubble = memo(function MessageBubble({
             <ThemedText type="code" themeColor="textSecondary" style={styles.assistantLabel}>
               Codex
             </ThemedText>
-            {markdownSegments.map((segment) =>
+            {markdownSegments.map((segment, index) =>
               segment.kind === "code" ? (
                 <HighlightedCodeBlock
-                  key={`code-${segment.language}-${segment.code}`}
+                  key={messageSegmentRenderKey(segment, index)}
                   code={segment.code}
                   deferHighlight={message.state === "streaming"}
                   language={segment.language}
@@ -349,11 +359,12 @@ export const MessageBubble = memo(function MessageBubble({
               ) : (
                 <EnrichedMarkdownText
                   allowFontScaling={false}
-                  key={`markdown-${segment.content}`}
+                  key={messageSegmentRenderKey(segment, index)}
                   maxFontSizeMultiplier={1}
-                  markdown={segment.content.trimEnd() || " "}
+                  markdown={messageMarkdownContentForRender(segment.content)}
                   selectable
-                  streamingAnimation={message.state === "streaming"}
+                  // Tiny Codex deltas restart the native fade before intermediate text is presented.
+                  streamingAnimation={false}
                   markdownStyle={assistantMarkdownStyle}
                 />
               ),
@@ -398,6 +409,11 @@ export const MessageBubble = memo(function MessageBubble({
             canCopy={copyMarkdown.length > 0}
             isCopied={isCopied}
             onCopyPress={handleCopyPress}
+            onRewindPress={
+              isUser && onMessageRewind && message.turnId
+                ? () => onMessageRewind(message)
+                : undefined
+            }
             timestamp={timestamp}
             variant={isUser ? "user" : "assistant"}
           />
@@ -411,12 +427,14 @@ function MessageFooter({
   canCopy,
   isCopied,
   onCopyPress,
+  onRewindPress,
   timestamp,
   variant,
 }: {
   canCopy: boolean;
   isCopied: boolean;
   onCopyPress: () => void;
+  onRewindPress?: () => void;
   timestamp: string;
   variant: "assistant" | "user";
 }) {
@@ -449,6 +467,21 @@ function MessageFooter({
       >
         <Icon name={isCopied ? "check" : "copy"} size={12} tintColor={iconTint} strokeWidth={2.2} />
       </Pressable>
+      {onRewindPress ? (
+        <Pressable
+          accessibilityLabel="Rewind chat to before this message"
+          accessibilityRole="button"
+          hitSlop={11}
+          onPress={onRewindPress}
+          style={({ pressed }) => [
+            styles.copyButton,
+            isUser && styles.userCopyButton,
+            pressed && styles.pressed,
+          ]}
+        >
+          <Icon name="rewind" size={12} tintColor={iconTint} strokeWidth={2.2} />
+        </Pressable>
+      ) : null}
     </View>
   );
 }
@@ -943,7 +976,7 @@ function parseMarkdownSegments(markdown: string): MarkdownSegment[] {
     if (fenceMatch) {
       if (isInCodeBlock) {
         segments.push({
-          code: trimCodeFenceContent(codeLines.join("\n")),
+          code: messageCodeContentForRender(codeLines.join("\n")),
           kind: "code",
           language: codeLanguage,
         });
@@ -974,7 +1007,7 @@ function parseMarkdownSegments(markdown: string): MarkdownSegment[] {
 
   if (isInCodeBlock) {
     segments.push({
-      code: trimCodeFenceContent(codeLines.join("\n")),
+      code: messageCodeContentForRender(codeLines.join("\n")),
       kind: "code",
       language: codeLanguage,
     });
@@ -988,10 +1021,6 @@ function parseMarkdownSegments(markdown: string): MarkdownSegment[] {
   }
 
   return segments.length > 0 ? segments : [{ content: markdown, kind: "markdown" }];
-}
-
-function trimCodeFenceContent(code: string) {
-  return code.replace(/^\n/, "").replace(/\n$/, "");
 }
 
 function normalizeCodeLanguage(value: string) {

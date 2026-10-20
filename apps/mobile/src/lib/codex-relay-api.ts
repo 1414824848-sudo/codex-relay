@@ -1,5 +1,8 @@
 import "react-native-get-random-values";
 
+import { errorMessage } from "./api-error-message";
+import { firstReachablePairingUrl } from "./pairing-reachability";
+
 import {
   ArchiveThreadResponseSchema,
   CheckoutWorkspaceBranchRequestSchema,
@@ -14,22 +17,31 @@ import {
   ListWorkspaceFilesResponseSchema,
   ListWorkspaceDirectoriesResponseSchema,
   PairResponseSchema,
+  PushNotificationSettingsResponseSchema,
   QueuedThreadInputActionResponseSchema,
   RateLimitsResponseSchema,
+  RenameThreadRequestSchema,
+  RenameThreadResponseSchema,
   ResolveApprovalResponseSchema,
+  RewindThreadRequestSchema,
   RuntimePreferencesResponseSchema,
   RunThreadResponseSchema,
   StatusResponseSchema,
   SubmitThreadInputResponseSchema,
   ThreadContextWindowResponseSchema,
   ThreadDetailResponseSchema,
+  ThreadGoalResponseSchema,
   ThreadMessageDetailResponseSchema,
+  RegisterPushNotificationRequestSchema,
+  UpdateThreadGoalRequestSchema,
   UpdateWorkspaceFileContentRequestSchema,
   UpdateRuntimePreferencesRequestSchema,
   VersionResponseSchema,
   WorkspaceFileContentResponseSchema,
   WorkspaceChangesResponseSchema,
   WorkspaceGitActionResponseSchema,
+  WorkspaceTailscaleServeRequestSchema,
+  WorkspaceTailscaleServeResponseSchema,
   WorkspaceTerminalOutputResponseSchema,
   WorkspaceTerminalSessionResponseSchema,
   apiPaths,
@@ -45,11 +57,16 @@ import {
   type ListThreadsResponse,
   type ListWorkspaceFilesResponse,
   type ListWorkspaceDirectoriesResponse,
+  type PushNotificationSettingsResponse,
   type QueuedThreadInputActionResponse,
   type RateLimitsResponse,
+  type RenameThreadRequest,
+  type RenameThreadResponse,
   type ResolveApprovalRequest,
   type ResolveApprovalResponse,
+  type RewindThreadRequest,
   type RuntimePreferencesResponse,
+  type RegisterPushNotificationRequest,
   type RunThreadRequest,
   type RunThreadResponse,
   type StatusResponse,
@@ -58,8 +75,10 @@ import {
   type SubmitThreadInputResponse,
   type ThreadContextWindowResponse,
   type ThreadDetailResponse,
+  type ThreadGoalResponse,
   type ThreadMessageDetailField,
   type ThreadMessageDetailResponse,
+  type UpdateThreadGoalRequest,
   type UpdateWorkspaceFileContentRequest,
   type UpdateRuntimePreferencesRequest,
   type VersionResponse,
@@ -67,12 +86,13 @@ import {
   type WorkspaceChangesResponse,
   type WorkspaceGitActionResponse,
   type WorkspaceSelectionRequest,
+  type WorkspaceTailscaleServeRequest,
+  type WorkspaceTailscaleServeResponse,
   type WorkspaceTerminalOutputResponse,
   type WorkspaceTerminalSessionResponse,
 } from "codex-relay/api-schema";
 import { Platform } from "react-native";
 import { dfetch, dfetchStream } from "react-native-direct-fetch";
-import { createMMKV } from "react-native-mmkv";
 import { fetch as nitroFetch } from "react-native-nitro-fetch";
 import EventSource from "react-native-sse";
 import {
@@ -89,21 +109,31 @@ import {
   parseThreadRunStreamPayload,
   threadRunStreamEventTypes,
 } from "./thread-run-stream";
-import { isClientTokenExpiredByInactivity, markInactiveSessionExpired } from "./session-expiration";
+import { requestWithNetworkTimeout, withTimeout } from "./network-timeout";
+import {
+  clearCodexRelayServerUrlState,
+  codexRelayStorage as storage,
+  dedupeServerUrls,
+  fallbackCodexRelayServerUrl,
+  getCodexRelayServerUrl,
+  getCodexRelayServerUrlCandidates,
+  isCarrierGradePrivateIPv4Host,
+  isLocalIPv6Host,
+  isPrivateIPv4Host,
+  normalizeServerUrl,
+  saveCodexRelayServerUrlCandidates,
+  setCodexRelayServerUrl,
+  type CodexRelayServerUrlCandidate,
+} from "./codex-relay-server-url-storage";
 
-const defaultServerUrl = "http://localhost:8787";
 const skillsPath = "/v1/skills";
 const skillsRequestTimeoutMs = 8000;
 const clientSessionIdStorageKey = "codex-relay.client-session-id";
-const clientTokenExpiresAtStorageKey = "codex-relay.client-token-expires-at";
+const legacyClientTokenExpiresAtStorageKey = "codex-relay.client-token-expires-at";
 const clientTokenStorageKey = "codex-relay.client-token";
-const clientTokenRefreshLeewayMs = 24 * 60 * 60 * 1000;
 const pairingConnectTimeoutMs = 2500;
 const streamRequestTimeoutMs = 10 * 60 * 1000;
 const terminalStreamRequestTimeoutMs = 24 * 60 * 60 * 1000;
-const serverUrlCandidatesStorageKey = "codex-relay.server-url-candidates";
-const serverUrlStorageKey = "codex-relay.server-url";
-const storage = createMMKV({ id: "codex-relay" });
 
 type NetworkRequestInit = RequestInit & {
   timeoutMs?: number;
@@ -115,10 +145,14 @@ type PairingQrPayload = {
   serverUrls: string[];
 };
 
-export type CodexRelayServerUrlCandidate = {
-  label: string;
-  url: string;
+export {
+  fallbackCodexRelayServerUrl,
+  getCodexRelayServerUrl,
+  getCodexRelayServerUrlCandidates,
+  normalizeServerUrl,
+  setCodexRelayServerUrl,
 };
+export type { CodexRelayServerUrlCandidate };
 
 class CodexRelayApiError extends Error {
   code: string | undefined;
@@ -153,26 +187,6 @@ export function isPairingQrPayloadError(error: unknown) {
   return error instanceof PairingQrPayloadError;
 }
 
-export const fallbackCodexRelayServerUrl =
-  process.env.EXPO_PUBLIC_CODEX_RELAY_SERVER_URL?.replace(/\/$/, "") ?? defaultServerUrl;
-
-export function getCodexRelayServerUrl() {
-  return storage.getString(serverUrlStorageKey) ?? fallbackCodexRelayServerUrl;
-}
-
-export function getCodexRelayServerUrlCandidates(): CodexRelayServerUrlCandidate[] {
-  return serverUrlCandidatesFromUrls([
-    getCodexRelayServerUrl(),
-    ...readStoredServerUrlCandidates(),
-  ]);
-}
-
-export function setCodexRelayServerUrl(url: string) {
-  const normalizedUrl = normalizeServerUrl(url);
-  storage.set(serverUrlStorageKey, normalizedUrl);
-  return normalizedUrl;
-}
-
 export function resolveCodexRelayUrl(url: string) {
   if (/^[a-z][a-z0-9+.-]*:/i.test(url)) {
     return url;
@@ -197,29 +211,14 @@ export function codexRelayImageRequestHeaders() {
 }
 
 export function signOutCodexRelaySession() {
-  clearClientSession("signed-out");
+  storage.remove(clientTokenStorageKey);
+  storage.remove(legacyClientTokenExpiresAtStorageKey);
+  clearSecureSession();
+  clearCodexRelayServerUrlState();
 }
 
 export function hasCodexRelaySession() {
   return Boolean(storage.getString(clientTokenStorageKey));
-}
-
-type ClientSessionClearReason = "inactive-expired" | "invalid" | "signed-out";
-
-function clearClientSession(reason: ClientSessionClearReason) {
-  storage.remove(clientTokenStorageKey);
-  storage.remove(clientTokenExpiresAtStorageKey);
-  clearSecureSession();
-  if (reason === "inactive-expired") {
-    markInactiveSessionExpired();
-  }
-}
-
-function clearInvalidClientSession() {
-  const reason = isClientTokenExpiredByInactivity(storage.getString(clientTokenExpiresAtStorageKey))
-    ? "inactive-expired"
-    : "invalid";
-  clearClientSession(reason);
 }
 
 export async function pairWithQrPayload(
@@ -229,10 +228,29 @@ export async function pairWithQrPayload(
   const pairingPayload = parsePairingQrPayload(payload);
   const connectionErrors: PairingCandidateConnectionError[] = [];
 
-  for (const serverUrl of pairingPayload.serverUrls) {
+  const reachableUrl = await firstReachablePairingUrl(
+    pairingPayload.serverUrls,
+    async (serverUrl) => {
+      const response = await fetchWithNetworkContext(`${serverUrl}${apiPaths.version}`, {
+        timeoutMs: pairingConnectTimeoutMs,
+      });
+      if (!response.ok || !VersionResponseSchema.safeParse(await response.json()).success) {
+        throw new Error(`No Codex Relay found at ${serverUrl}.`);
+      }
+    },
+  ).catch(() => {
+    throw new Error(
+      "Could not reach your computer. Check that the relay is running and both devices are on the same LAN or connected to Tailscale.",
+    );
+  });
+  const serverUrls = [
+    reachableUrl,
+    ...pairingPayload.serverUrls.filter((url) => url !== reachableUrl),
+  ];
+  for (const serverUrl of serverUrls) {
     try {
       const paired = await pairWithApproval(serverUrl, pairingPayload.serverPublicKey, handlers);
-      saveServerUrlCandidates([paired.serverUrl, ...pairingPayload.serverUrls]);
+      saveCodexRelayServerUrlCandidates([paired.serverUrl, ...pairingPayload.serverUrls]);
       return {
         ...pairingPayload,
         serverUrl: paired.serverUrl,
@@ -296,7 +314,7 @@ async function pairWithApproval(
   handlers?.onApprovalCode?.(parsed.approvalCode, normalizedServerUrl);
   const approved = await waitForPairingApproval(normalizedServerUrl, parsed.approvalCode);
   const session = completeSecurePairing(securePairing, approved);
-  saveSession(normalizedServerUrl, session.clientToken, session.clientTokenExpiresAt);
+  saveSession(normalizedServerUrl, session.clientToken);
   await startPairingTrialIfNeeded();
   return { approvalCode: parsed.approvalCode, serverUrl: normalizedServerUrl };
 }
@@ -331,7 +349,7 @@ async function waitForPairingApproval(serverUrl: string, approvalCode: string) {
 async function fetchWithNetworkContext(url: string, init?: NetworkRequestInit) {
   if (isLocalhostUrl(url)) {
     try {
-      return await requestWithOptionalTimeout(fetch(url, init), init?.timeoutMs);
+      return await requestWithNetworkTimeout(fetch(url, init), init?.timeoutMs);
     } catch (error) {
       throw new Error(
         `Network request failed via fetch for ${url}: ${errorMessage(error, "network error")}`,
@@ -343,9 +361,9 @@ async function fetchWithNetworkContext(url: string, init?: NetworkRequestInit) {
   const transport = useDirectFetch ? "dfetch" : "nitroFetch";
   try {
     if (useDirectFetch) {
-      return await requestWithOptionalTimeout(dfetch(url, init), init?.timeoutMs);
+      return await requestWithNetworkTimeout(dfetch(url, init), init?.timeoutMs);
     }
-    return await requestWithOptionalTimeout(nitroFetch(url, init), init?.timeoutMs);
+    return await requestWithNetworkTimeout(nitroFetch(url, init), init?.timeoutMs);
   } catch (error) {
     throw new Error(
       `Network request failed via ${transport} for ${url}: ${errorMessage(error, "network error")}`,
@@ -404,95 +422,9 @@ function isLocalhostUrl(url: string) {
   }
 }
 
-function isPrivateIPv4Host(host: string) {
-  const octets = host.split(".").map(Number);
-  if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet))) {
-    return false;
-  }
-  return (
-    octets[0] === 10 ||
-    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
-    (octets[0] === 192 && octets[1] === 168) ||
-    (octets[0] === 169 && octets[1] === 254)
-  );
-}
-
-function isCarrierGradePrivateIPv4Host(host: string) {
-  const octets = host.split(".").map(Number);
-  return octets.length === 4 && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
-}
-
-function isLocalIPv6Host(host: string) {
-  const normalized = host.replace(/^\[/, "").replace(/\]$/, "");
-  return (
-    normalized.startsWith("fe80:") || normalized.startsWith("fc") || normalized.startsWith("fd")
-  );
-}
-
 export async function refreshSession() {
-  if (!storage.getString(clientTokenStorageKey)) {
-    return false;
-  }
-  if (!shouldRefreshClientToken()) {
-    return true;
-  }
-
-  const response = await fetchWithNetworkContext(
-    `${getCodexRelayServerUrl()}${apiPaths.sessionRefresh}`,
-    {
-      method: "POST",
-      headers: requestHeaders(undefined),
-    },
-  );
-  const responsePayload = await response.json().catch(() => undefined);
-
-  if (!response.ok) {
-    if (isSessionInvalidStatus(response.status)) {
-      clearInvalidClientSession();
-    }
-    throw new Error(
-      errorMessage(responsePayload, `Codex Relay server returned ${response.status}`),
-    );
-  }
-
-  const parsed = PairResponseSchema.parse(decryptResponsePayload(responsePayload));
-  if (!parsed.clientToken || !parsed.clientTokenExpiresAt) {
-    throw new Error("Session refresh response did not include a usable session.");
-  }
-  saveSession(getCodexRelayServerUrl(), parsed.clientToken, parsed.clientTokenExpiresAt);
-  return true;
-}
-
-function shouldRefreshClientToken() {
-  const expiresAt = storage.getString(clientTokenExpiresAtStorageKey);
-  if (!expiresAt) {
-    return true;
-  }
-
-  const expiresAtMs = Date.parse(expiresAt);
-  if (!Number.isFinite(expiresAtMs)) {
-    return true;
-  }
-
-  return expiresAtMs - Date.now() <= clientTokenRefreshLeewayMs;
-}
-
-function isSessionInvalidStatus(status: number) {
-  return status === 401 || status === 403 || status === 410;
-}
-
-export function normalizeServerUrl(url: string) {
-  const trimmed = url.trim().replace(/\/$/, "");
-  if (!trimmed) {
-    throw new Error("Server URL is empty.");
-  }
-
-  const parsed = new URL(trimmed);
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("Server URL must start with http:// or https://.");
-  }
-
-  return parsed.toString().replace(/\/$/, "");
+  storage.remove(legacyClientTokenExpiresAtStorageKey);
+  return hasCodexRelaySession();
 }
 
 function parsePairingQrPayload(payload: unknown): PairingQrPayload {
@@ -564,83 +496,19 @@ function parsePairingServerUrlsParam(value: string | null) {
   }
 
   try {
-    const parsed = JSON.parse(value) as unknown;
+    const parsed: unknown = JSON.parse(value);
     return Array.isArray(parsed)
       ? parsed.filter((url): url is string => typeof url === "string")
       : [];
   } catch {
     return [];
-  }
-}
-
-function dedupeServerUrls(urls: string[]) {
-  const deduped = new Set<string>();
-  for (const url of urls) {
-    try {
-      deduped.add(normalizeServerUrl(url));
-    } catch {
-      continue;
-    }
-  }
-  return [...deduped];
-}
-
-function readStoredServerUrlCandidates() {
-  const stored = storage.getString(serverUrlCandidatesStorageKey);
-  if (!stored) {
-    return [];
-  }
-
-  try {
-    const parsed = JSON.parse(stored) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter((url): url is string => typeof url === "string")
-      : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveServerUrlCandidates(urls: string[]) {
-  storage.set(serverUrlCandidatesStorageKey, JSON.stringify(dedupeServerUrls(urls)));
-}
-
-function serverUrlCandidatesFromUrls(urls: string[]): CodexRelayServerUrlCandidate[] {
-  return dedupeServerUrls(urls).map((url) => ({
-    label: serverUrlCandidateLabel(url),
-    url,
-  }));
-}
-
-function serverUrlCandidateLabel(url: string) {
-  try {
-    const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
-    if (host === "localhost" || host === "127.0.0.1" || host === "::1") {
-      return "Localhost";
-    }
-    if (host.endsWith(".local")) {
-      return "Local network";
-    }
-    if (host.endsWith(".ts.net") || host.endsWith(".beta.tailscale.net")) {
-      return "Tailscale DNS";
-    }
-    if (isCarrierGradePrivateIPv4Host(host)) {
-      return "Tailscale IP";
-    }
-    if (isPrivateIPv4Host(host) || isLocalIPv6Host(host)) {
-      return "LAN IP";
-    }
-    return "Server";
-  } catch {
-    return "Server";
   }
 }
 
 function pairingCandidateFailureMessage(errors: PairingCandidateConnectionError[]) {
   const attemptedUrls = errors.map((error) => error.serverUrl).join(", ");
   return attemptedUrls
-    ? `Could not reach any server URL from the pairing QR. Tried: ${attemptedUrls}. Make sure this device is on the same network, Tailscale is connected, or set CODEX_RELAY_PUBLIC_URL to a reachable URL.`
+    ? `Could not reach any server URL from the pairing QR. Tried: ${attemptedUrls}. Make sure this device is on the same network or Tailscale is connected.`
     : "Could not reach the server URL from the pairing QR.";
 }
 
@@ -665,6 +533,35 @@ export async function updateRuntimePreferences(
   );
 }
 
+export async function getPushNotificationSettings(): Promise<PushNotificationSettingsResponse> {
+  return request(
+    apiPaths.pushNotifications,
+    undefined,
+    PushNotificationSettingsResponseSchema.parse,
+  );
+}
+
+export async function registerPushNotifications(
+  body: RegisterPushNotificationRequest,
+): Promise<PushNotificationSettingsResponse> {
+  return request(
+    apiPaths.pushNotifications,
+    {
+      body: encryptRequestPayload(RegisterPushNotificationRequestSchema.parse(body)),
+      method: "PUT",
+    },
+    PushNotificationSettingsResponseSchema.parse,
+  );
+}
+
+export async function unregisterPushNotifications(): Promise<PushNotificationSettingsResponse> {
+  return request(
+    apiPaths.pushNotifications,
+    { method: "DELETE" },
+    PushNotificationSettingsResponseSchema.parse,
+  );
+}
+
 export async function listThreads(): Promise<ListThreadsResponse> {
   return request(apiPaths.threads, undefined, ListThreadsResponseSchema.parse);
 }
@@ -674,6 +571,20 @@ export async function archiveThread(threadId: string): Promise<ArchiveThreadResp
     apiPaths.threadArchive(threadId),
     { method: "DELETE" },
     ArchiveThreadResponseSchema.parse,
+  );
+}
+
+export async function renameThread(
+  threadId: string,
+  body: RenameThreadRequest,
+): Promise<RenameThreadResponse> {
+  return request(
+    apiPaths.threadName(threadId),
+    {
+      method: "POST",
+      body: encryptRequestPayload(RenameThreadRequestSchema.parse(body)),
+    },
+    RenameThreadResponseSchema.parse,
   );
 }
 
@@ -788,6 +699,19 @@ export async function commitPushWorkspace(
   );
 }
 
+export async function startWorkspaceTailscaleServe(
+  body: WorkspaceTailscaleServeRequest,
+): Promise<WorkspaceTailscaleServeResponse> {
+  return request(
+    apiPaths.workspaceTailscaleServe,
+    {
+      method: "POST",
+      body: encryptRequestPayload(WorkspaceTailscaleServeRequestSchema.parse(body)),
+    },
+    WorkspaceTailscaleServeResponseSchema.parse,
+  );
+}
+
 export async function createWorkspaceTerminalSession(body: {
   cols: number;
   rows: number;
@@ -854,9 +778,6 @@ export function streamWorkspaceTerminalOutput(
         return;
       }
       if (!response.ok) {
-        if (isSessionInvalidStatus(response.status)) {
-          clearInvalidClientSession();
-        }
         void response.text().then((text) => {
           let payload: unknown = text;
           try {
@@ -987,9 +908,6 @@ async function requestNoContent(path: string, init: RequestInit) {
   }
 
   const payload = decryptResponsePayload(await response.json().catch(() => undefined));
-  if (isSessionInvalidStatus(response.status)) {
-    clearInvalidClientSession();
-  }
   const message = errorMessage(payload, `Codex Relay server returned ${response.status}`);
   throw new CodexRelayApiError(message, response.status, errorCode(payload));
 }
@@ -998,8 +916,28 @@ export async function getRateLimits(): Promise<RateLimitsResponse> {
   return request(apiPaths.rateLimits, undefined, RateLimitsResponseSchema.parse);
 }
 
-export async function getThread(threadId: string): Promise<ThreadDetailResponse> {
-  return request(apiPaths.thread(threadId), undefined, ThreadDetailResponseSchema.parse);
+export async function getThread(
+  threadId: string,
+  options: { refresh?: boolean } = {},
+): Promise<ThreadDetailResponse> {
+  const path = options.refresh
+    ? `${apiPaths.thread(threadId)}?refresh=true`
+    : apiPaths.thread(threadId);
+  return request(path, undefined, ThreadDetailResponseSchema.parse);
+}
+
+export async function rewindThread(
+  threadId: string,
+  body: RewindThreadRequest,
+): Promise<ThreadDetailResponse> {
+  return request(
+    apiPaths.threadRollback(threadId),
+    {
+      method: "POST",
+      body: encryptRequestPayload(RewindThreadRequestSchema.parse(body)),
+    },
+    ThreadDetailResponseSchema.parse,
+  );
 }
 
 export async function getThreadMessageDetail(
@@ -1021,6 +959,34 @@ export async function getThreadContextWindow(
     apiPaths.threadContextWindow(threadId),
     undefined,
     ThreadContextWindowResponseSchema.parse,
+  );
+}
+
+export async function getThreadGoal(threadId: string): Promise<ThreadGoalResponse> {
+  return request(apiPaths.threadGoal(threadId), undefined, ThreadGoalResponseSchema.parse);
+}
+
+export async function updateThreadGoal(
+  threadId: string,
+  body: UpdateThreadGoalRequest,
+): Promise<ThreadGoalResponse> {
+  return request(
+    apiPaths.threadGoal(threadId),
+    {
+      method: "POST",
+      body: encryptRequestPayload(UpdateThreadGoalRequestSchema.parse(body)),
+    },
+    ThreadGoalResponseSchema.parse,
+  );
+}
+
+export async function clearThreadGoal(threadId: string): Promise<ThreadGoalResponse> {
+  return request(
+    apiPaths.threadGoal(threadId),
+    {
+      method: "DELETE",
+    },
+    ThreadGoalResponseSchema.parse,
   );
 }
 
@@ -1140,9 +1106,6 @@ function streamThreadRunWithDirectFetch(
         return;
       }
       if (!response.ok) {
-        if (isSessionInvalidStatus(response.status)) {
-          clearInvalidClientSession();
-        }
         void response.text().then((text) => {
           let payload: unknown = text;
           try {
@@ -1314,9 +1277,6 @@ async function request<T>(
   const payload = decryptResponsePayload(await response.json().catch(() => undefined));
 
   if (!response.ok) {
-    if (isSessionInvalidStatus(response.status)) {
-      clearInvalidClientSession();
-    }
     const message = errorMessage(payload, `Codex Relay server returned ${response.status}`);
     throw new CodexRelayApiError(message, response.status, errorCode(payload));
   }
@@ -1349,10 +1309,10 @@ function requestHeaders(
   return headers;
 }
 
-function saveSession(serverUrl: string, clientToken: string, clientTokenExpiresAt: string) {
-  storage.set(serverUrlStorageKey, serverUrl);
+function saveSession(serverUrl: string, clientToken: string) {
+  setCodexRelayServerUrl(serverUrl);
   storage.set(clientTokenStorageKey, clientToken);
-  storage.set(clientTokenExpiresAtStorageKey, clientTokenExpiresAt);
+  storage.remove(legacyClientTokenExpiresAtStorageKey);
 }
 
 export function getClientSessionId() {
@@ -1384,28 +1344,6 @@ function authorizationHeader() {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function errorMessage(payload: unknown, fallback: string) {
-  return payload &&
-    typeof payload === "object" &&
-    "error" in payload &&
-    payload.error &&
-    typeof payload.error === "object" &&
-    "message" in payload.error
-    ? String(payload.error.message)
-    : fallback;
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number) {
-  return new Promise<T>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Request timed out.")), timeoutMs);
-    promise.then(resolve, reject).finally(() => clearTimeout(timeout));
-  });
-}
-
-function requestWithOptionalTimeout<T>(promise: Promise<T>, timeoutMs: number | undefined) {
-  return timeoutMs && timeoutMs > 0 ? withTimeout(promise, timeoutMs) : promise;
 }
 
 function errorCode(payload: unknown) {

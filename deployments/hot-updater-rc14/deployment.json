@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "provider": "cloudflare",
+  "resources": {
+    "workerName": "codex-relay-ota",
+    "accountId": "e8488f1eee751a6aa2d4831c5de1c3dc",
+    "d1DatabaseId": "1a140b73-204a-4bcb-8492-f4760c40a834",
+    "d1DatabaseName": "codex-relay",
+    "bucketName": "codex-relay-storage"
+  },
+  "baseUrl": "https://codex-relay-ota.gron1gh1.workers.dev",
+  "deployedServerVersion": "1.0.0-rc.14",
+  "pendingStep": null,
+  "verifiedSteps": [
+    {
+      "id": "upgrades/1.0.0.md/preflight",
+      "target": {
+        "workerName": "codex-relay-ota",
+        "accountId": "e8488f1eee751a6aa2d4831c5de1c3dc",
+        "d1DatabaseId": "1a140b73-204a-4bcb-8492-f4760c40a834",
+        "d1DatabaseName": "codex-relay",
+        "bucketName": "codex-relay-storage"
+      },
+      "observation": "Live generation 1 rc.3; original 0001 history; private D1 export and Time Travel bookmark saved. Snapshot preserves 2333 events and reconstructs 1719 heads. Both migration phases match the official rc.14 schema in local verification; Worker dry-run passed.",
+      "checkedAt": "2026-09-10T12:43:54.488340+00:00"
+    },
+    {
+      "id": "upgrades/1.0.0.md/0002_modex_rc14_insights.sql",
+      "target": {
+        "accountId": "e8488f1eee751a6aa2d4831c5de1c3dc",
+        "databaseId": "1a140b73-204a-4bcb-8492-f4760c40a834"
+      },
+      "observation": "Migration recorded; all 2357 captured events preserved, six policy/artifact/key tables identical, foreign keys valid; old writers continued with 2357 events.",
+      "checkedAt": "2026-09-10T12:44:16.964Z"
+    },
+    {
+      "id": "upgrades/1.0.0.md/cf.worker",
+      "target": {
+        "accountId": "e8488f1eee751a6aa2d4831c5de1c3dc",
+        "workerName": "codex-relay-ota"
+      },
+      "observation": "Worker b3657a65-67c3-454a-a2f4-62351029ffc8 serves generation 1 rc.14; authenticated catalog probe and doctor pass.",
+      "checkedAt": "2026-09-10T12:45:43.939Z"
+    },
+    {
+      "id": "upgrades/1.0.0.md/ship.console",
+      "target": {
+        "context": "kind-ship",
+        "namespace": "ship-services",
+        "service": "codex-relay",
+        "host": "codex-relay.gron-studio.com",
+        "sourceCommit": "08fafb2283058e24264326eb86044bc67894d0c1"
+      },
+      "observation": "Ship image ship/codex-relay:20260910124600 ready 1/1; existing OAuth session retained; authenticated Insights renders Active, Downloaded and Recovered metrics from production D1.",
+      "checkedAt": "2026-09-10T12:47:48.153Z"
+    },
+    {
+      "id": "upgrades/1.0.0.md/0003_modex_rc14_finalize.sql",
+      "target": {
+        "accountId": "e8488f1eee751a6aa2d4831c5de1c3dc",
+        "databaseId": "1a140b73-204a-4bcb-8492-f4760c40a834"
+      },
+      "observation": "Finalization recorded; all 2357 captured events and metadata preserved; six policy/artifact/key tables identical, foreign keys valid, temporary triggers removed; schema.core remains 1.0.0.",
+      "checkedAt": "2026-09-10T12:48:49.730Z"
+    },
+    {
+      "id": "upgrades/1.0.0.md/common.verify",
+      "target": {
+        "baseUrl": "https://codex-relay-ota.gron1gh1.workers.dev",
+        "databaseId": "1a140b73-204a-4bcb-8492-f4760c40a834"
+      },
+      "observation": "Final remote schema matches the official rc.14 tables, columns, defaults, foreign keys and indexes. Authenticated catalog returns 200 and anonymous request 401; catalog preflight is unchanged. Local R2 credentials list successfully; existing 9,376,048-byte artifact downloads and verifies with the retained public signing key. Migration tests, server tests (330 passed), workspace typecheck and lint pass. iOS pod install completed; native recovery fixes still require a new binary.",
+      "checkedAt": "2026-09-10T12:52:31.360Z"
+    },
+    {
+      "id": "upgrades/1.0.0.md/ios.ota",
+      "target": {
+        "platform": "ios",
+        "channel": "production",
+        "targetAppVersion": "1.5.0",
+        "rolloutPercent": 100,
+        "isForceUpdate": false,
+        "releaseId": "01a08b62-c3eb-7e13-8507-c9ef394d0458",
+        "bundleId": "01a08b61-67d6-78cd-aacf-af17471fd8a5",
+        "sourceCommit": "3a562d351d583f400afdc7d49d0767407ef41222"
+      },
+      "observation": "Signed deployment completed; catalog generation 16 has two releases and passes preflight. The 9,377,329-byte artifact downloads and verifies with the retained public signing key (SHA-256 3b4487297f6e7e9f498b1fe8279bf136b687bb520bae59d36ee3d6f3023679d2). The existing iOS 1.5.0 simulator binary downloaded and applied this update after restart, displays current status, and reported UPDATE_APPLIED and UNCHANGED with SDK 1.0.0-rc.14 for this bundle. No new native binary was installed.",
+      "checkedAt": "2026-09-10T12:59:57.786228+00:00"
+    },
+    {
+      "id": "upgrades/1.0.0.md/ios.ota.download-verification",
+      "target": {
+        "platform": "ios",
+        "channel": "production",
+        "targetAppVersion": "1.5.0",
+        "rolloutPercent": 100,
+        "isForceUpdate": false,
+        "releaseId": "01a08b6c-c41a-7ec9-a4dc-a6556938d94d",
+        "bundleId": "01a08b6b-76cb-750c-9e2b-14470d0ca3e3",
+        "sourceCommit": "a4618c0695c7e99b02dffa490770c2ed15d33036"
+      },
+      "observation": "User-requested second signed OTA deployed successfully; catalog generation 17 with three releases passes preflight. Download and signature verification pass (9,377,329 bytes; SHA-256 d8903cce1bb9b82f664a019ba8d7cfa46a690fea435255cb4db14802dbbe9007). Hermes is unchanged from the immediately preceding bundle, so that path reuses it without a diff patch. The rc.14 simulator downloaded and staged the update, reporting one UPDATE_DOWNLOADED event with SDK 1.0.0-rc.14; production iOS pending installations increased from zero to one. The simulator remains at restart ready. Console Downloaded measures pending installations, not cumulative downloads.",
+      "checkedAt": "2026-09-10T13:07:44.952346+00:00"
+    }
+  ]
+}

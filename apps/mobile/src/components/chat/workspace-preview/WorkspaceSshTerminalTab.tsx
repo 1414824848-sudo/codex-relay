@@ -6,6 +6,7 @@ import {
   TextInput,
   View,
   type GestureResponderEvent,
+  type TextInputInstance,
 } from "react-native";
 import { KeyboardAvoidingView, useKeyboardState } from "react-native-keyboard-controller";
 import { StyleSheet } from "react-native-unistyles";
@@ -43,17 +44,38 @@ const terminalArrowSequences = {
   up: "\x1b[A",
 };
 
-export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: string }) {
+type PersistentTerminalSession = {
+  fontSize: number;
+  sessionId: string | null;
+  workspacePath: string | null;
+};
+
+// Sessions that outlive their screen for the lifetime of the JS runtime.
+const persistentTerminalSessions = new Map<string, PersistentTerminalSession>();
+
+export function WorkspaceSshTerminalTab({
+  persistentSessionKey,
+  workspacePath,
+}: {
+  /** Keeps the terminal session open across unmounts while the app is alive. */
+  persistentSessionKey?: string;
+  workspacePath?: string;
+}) {
+  const persistentSession = persistentSessionKey
+    ? persistentTerminalSessions.get(persistentSessionKey)
+    : undefined;
   const terminalIdRef = useRef<string | null>(null);
-  const activeSessionIdRef = useRef<string | null>(null);
-  const terminalInputRef = useRef<TextInput>(null);
+  const activeSessionIdRef = useRef<string | null>(persistentSession?.sessionId ?? null);
+  const terminalInputRef = useRef<TextInputInstance>(null);
   const terminalTapStartRef = useRef<{ x: number; y: number } | null>(null);
   const terminalTapMovedRef = useRef(false);
   const terminalNativeInputValueRef = useRef("");
   const terminalInputClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const terminalRequestQueueRef = useRef<Promise<void>>(Promise.resolve());
   const terminalOutputStreamRef = useRef<null | (() => void)>(null);
-  const activeSessionWorkspacePathRef = useRef<string | null>(null);
+  const activeSessionWorkspacePathRef = useRef<string | null>(
+    persistentSession?.workspacePath ?? null,
+  );
   const keyboardAvoidingEnabled = useKeyboardState(
     (state) => state.isVisible && state.height > 120,
   );
@@ -66,11 +88,36 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
   const [terminalInputValue, setTerminalInputValue] = useState("");
   const [isCtrlActive, setIsCtrlActive] = useState(false);
   const [isShortcutsExpanded, setIsShortcutsExpanded] = useState(false);
-  const [terminalFontSize, setTerminalFontSize] = useState(defaultTerminalFontSize);
+  const [terminalFontSize, setTerminalFontSize] = useState(
+    persistentSession?.fontSize ?? defaultTerminalFontSize,
+  );
   const [reconnectRequestId, setReconnectRequestId] = useState(0);
   const [terminalSessionStatus, setTerminalSessionStatus] =
     useState<WorkspaceSshTerminalSessionStatus>("connecting");
   const [terminalSessionMessage, setTerminalSessionMessage] = useState<string | null>(null);
+
+  const syncPersistentSession = (fontSize = terminalFontSize) => {
+    if (!persistentSessionKey) {
+      return;
+    }
+    persistentTerminalSessions.set(persistentSessionKey, {
+      fontSize,
+      sessionId: activeSessionIdRef.current,
+      workspacePath: activeSessionWorkspacePathRef.current,
+    });
+  };
+
+  const setActiveSession = (sessionId: string, sessionWorkspacePath: string | null) => {
+    activeSessionIdRef.current = sessionId;
+    activeSessionWorkspacePathRef.current = sessionWorkspacePath;
+    syncPersistentSession();
+  };
+
+  const clearActiveSession = () => {
+    activeSessionIdRef.current = null;
+    activeSessionWorkspacePathRef.current = null;
+    syncPersistentSession();
+  };
 
   const focusTerminalKeyboard = () => {
     terminalInputRef.current?.focus();
@@ -182,6 +229,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
       Math.max(minimumTerminalFontSize, nextFontSize),
     );
     setTerminalFontSize(clampedFontSize);
+    syncPersistentSession(clampedFontSize);
     postWorkspaceSshTerminalState({
       fontSize: clampedFontSize,
       reconnectRequestId,
@@ -213,8 +261,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
           () => {},
         );
         if (activeSessionIdRef.current === sessionId) {
-          activeSessionIdRef.current = null;
-          activeSessionWorkspacePathRef.current = null;
+          clearActiveSession();
         }
       },
       reportError(message) {
@@ -235,11 +282,10 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
         setTerminalSessionStatus(status);
         setTerminalSessionMessage(message ?? null);
         if (sessionId && status === "connected") {
-          activeSessionIdRef.current = sessionId;
+          setActiveSession(sessionId, activeSessionWorkspacePathRef.current);
         }
         if (sessionId && status === "closed" && activeSessionIdRef.current === sessionId) {
-          activeSessionIdRef.current = null;
-          activeSessionWorkspacePathRef.current = null;
+          clearActiveSession();
         }
       },
       async resizeSession(sessionId, cols, rows) {
@@ -254,8 +300,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
         terminalOutputStreamRef.current = streamWorkspaceTerminalOutput(sessionId, since, {
           onError(error) {
             if (isTerminalSessionMissing(error) && activeSessionIdRef.current === sessionId) {
-              activeSessionIdRef.current = null;
-              activeSessionWorkspacePathRef.current = null;
+              clearActiveSession();
             }
             handleTerminalApiError(error);
           },
@@ -266,8 +311,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
               terminalId,
             });
             if (response.exitedAt && activeSessionIdRef.current === sessionId) {
-              activeSessionIdRef.current = null;
-              activeSessionWorkspacePathRef.current = null;
+              clearActiveSession();
               stopTerminalOutputStream();
             }
           },
@@ -288,8 +332,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
             if (!isTerminalSessionMissing(error)) {
               throw error;
             }
-            activeSessionIdRef.current = null;
-            activeSessionWorkspacePathRef.current = null;
+            clearActiveSession();
           }
         }
         const response = await enqueueTerminalRequest(() =>
@@ -299,8 +342,7 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
             workspacePath,
           }),
         );
-        activeSessionIdRef.current = response.sessionId;
-        activeSessionWorkspacePathRef.current = response.workspacePath;
+        setActiveSession(response.sessionId, response.workspacePath);
         return {
           sessionId: response.sessionId,
           workspacePath: response.workspacePath,
@@ -337,11 +379,13 @@ export function WorkspaceSshTerminalTab({ workspacePath }: { workspacePath?: str
         terminalInputClearTimerRef.current = null;
       }
       stopTerminalOutputStream();
+      if (persistentSessionKey) {
+        return;
+      }
       const activeSessionId = activeSessionIdRef.current;
       if (activeSessionId) {
         void enqueueTerminalRequest(() => closeWorkspaceTerminalSession(activeSessionId));
-        activeSessionIdRef.current = null;
-        activeSessionWorkspacePathRef.current = null;
+        clearActiveSession();
       }
     },
     [],

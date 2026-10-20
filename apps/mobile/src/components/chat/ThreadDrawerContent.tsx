@@ -5,18 +5,9 @@ import type { ThreadSummary } from "codex-relay/api-schema";
 import { router } from "expo-router";
 import type { Drawer } from "expo-router/drawer";
 import type { ComponentProps } from "react";
-import { memo, useCallback, useEffect, useMemo, useReducer, useRef } from "react";
-import {
-  Alert,
-  InteractionManager,
-  Keyboard,
-  Linking,
-  Modal,
-  Pressable,
-  TextInput,
-  View,
-  type ViewStyle,
-} from "react-native";
+import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { Alert, Keyboard, Linking, Modal, Pressable, TextInput, View } from "react-native";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   Easing,
   useAnimatedStyle,
@@ -28,7 +19,11 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { StyleSheet } from "react-native-unistyles";
 
 import { FaGithub } from "@/assets/icons/fa";
-import { SheetActionRow } from "@/components/ui/bottom-sheet";
+import {
+  AppBottomSheet,
+  AppBottomSheetTextInput,
+  SheetActionRow,
+} from "@/components/ui/bottom-sheet";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
@@ -44,6 +39,7 @@ import {
   fetchThreadsState,
   fetchWorkspaceDirectoriesState,
   optimisticallyArchiveThreadState,
+  renameThreadServerState,
   restoreOptimisticArchiveThreadState,
   serverStateKeys,
   serverStateQueryFns,
@@ -52,6 +48,7 @@ import {
   setThreadsState,
 } from "@/lib/server-state";
 import { evaluateRelayVersion, type RelayVersionCompatibility } from "@/lib/version-policy";
+import { workspaceName } from "@/lib/workspace-name";
 import {
   chatStore$,
   requestThreadStreamReconnect,
@@ -60,17 +57,8 @@ import {
   setHasPairedSession,
   setThreadMessagesLoading,
 } from "@/state/chat-store";
-
-type DrawerRow =
-  | {
-      id: string;
-      kind: "project";
-      projectKey: string;
-      title: string;
-      workspacePath?: string;
-    }
-  | { id: string; kind: "thread"; projectKey: string; thread: ThreadSummary }
-  | { id: string; kind: "more"; hiddenCount: number; projectKey: string };
+import { pinnedThreadStore$, togglePinnedThread, unpinThread } from "@/state/pinned-thread-store";
+import { buildDrawerRows, type DrawerRow } from "./thread-drawer-rows";
 
 type WorkspaceBrowser = {
   directories: { name: string; path: string }[];
@@ -106,11 +94,15 @@ type ThreadDrawerUiAction =
 
 type ThreadDrawerContentProps = Parameters<
   NonNullable<ComponentProps<typeof Drawer>["drawerContent"]>
->[0];
+>[0] & {
+  isPermanent?: boolean;
+  onSidebarResize?: (translationX: number) => void;
+  onSidebarResizeStart?: () => void;
+  showResizeHandle?: boolean;
+};
 
 type ThreadDrawerNavigation = ThreadDrawerContentProps["navigation"];
 
-const collapsedProjectThreadCount = 5;
 const drawerListDrawDistance = 96;
 const drawerRowEstimatedSize = 40;
 const drawerListIdleTimeoutMs = 180;
@@ -157,7 +149,9 @@ function threadDrawerUiReducer(
 
 export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
   const drawerStatus = getDrawerStatus(props.state);
+  const isDrawerVisible = props.isPermanent || drawerStatus === "open";
   const insets = useSafeAreaInsets();
+  const theme = useTheme();
   const queryClient = useQueryClient();
   const createThreadMutation = useMutation({
     mutationFn: (body: Parameters<typeof createThreadServerState>[1]) =>
@@ -190,11 +184,17 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         setActiveThread(context.previousActiveThreadId);
       }
     },
-    onSuccess: async () => {
+    onSuccess: async (_response, threadId) => {
+      unpinThread(threadId);
       await queryClient.invalidateQueries({ queryKey: serverStateKeys.threads() });
     },
   });
+  const renameThreadMutation = useMutation({
+    mutationFn: ({ threadId, title }: { threadId: string; title: string }) =>
+      renameThreadServerState(queryClient, threadId, { title }),
+  });
   const activeThreadId = useSelector(() => chatStore$.activeThreadId.get());
+  const pinnedThreadIds = useSelector(() => pinnedThreadStore$.threadIds.get());
   const statusQuery = useQuery({
     queryKey: serverStateKeys.status(),
     queryFn: serverStateQueryFns.status,
@@ -208,16 +208,21 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
   const versionQuery = useQuery({
     queryKey: serverStateKeys.version(),
     queryFn: serverStateQueryFns.version,
-    enabled: drawerStatus === "open",
+    enabled: isDrawerVisible,
     retry: false,
     staleTime: 60_000,
   });
   const workspacePath = statusQuery.data?.workspacePath;
+  const canMutateAppServerThreads =
+    statusQuery.data?.appServerAvailable === true && threadsQuery.data?.source === "app-server";
   const versionCompatibility = useMemo(
     () => evaluateRelayVersion(versionQuery.data, versionQuery.error),
     [versionQuery.data, versionQuery.error],
   );
   const [uiState, dispatchUi] = useReducer(threadDrawerUiReducer, initialThreadDrawerUiState);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [threadWithActions, setThreadWithActions] = useState<ThreadSummary | undefined>(undefined);
+  const [threadToRename, setThreadToRename] = useState<ThreadSummary | undefined>(undefined);
   const {
     canRenderThreadList,
     expandedProjects,
@@ -247,12 +252,74 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         visibleThreads,
         expandedProjects,
         activeThreadId,
+        pinnedThreadIds,
         Boolean(normalizedSearchQuery),
       ),
-    [activeThreadId, expandedProjects, normalizedSearchQuery, visibleThreads],
+    [activeThreadId, expandedProjects, normalizedSearchQuery, pinnedThreadIds, visibleThreads],
   );
   const workspaceRows = useMemo(() => workspaceBrowserRows(workspaceBrowser), [workspaceBrowser]);
-  const searchClearAnimatedStyle = useAnimatedStyle<ViewStyle>(() => ({
+  const threadWithActionsIsPinned = Boolean(
+    threadWithActions && pinnedThreadIds.includes(threadWithActions.id),
+  );
+  const canSaveRenamedThread = Boolean(
+    canMutateAppServerThreads &&
+    threadToRename &&
+    renameDraft.trim() &&
+    renameDraft.trim() !== threadToRename.title &&
+    !renameThreadMutation.isPending,
+  );
+  const openThreadActions = useCallback((thread: ThreadSummary) => {
+    hapticSelection();
+    setThreadWithActions(thread);
+  }, []);
+  const openRenameThread = useCallback(() => {
+    if (!threadWithActions) {
+      return;
+    }
+    setThreadToRename(threadWithActions);
+    setRenameDraft(threadWithActions.title);
+  }, [threadWithActions]);
+  const closeThreadActions = useCallback(() => {
+    setThreadWithActions(undefined);
+    setThreadToRename(undefined);
+    setRenameDraft("");
+  }, []);
+  const handleTogglePinnedThread = useCallback(
+    (thread: ThreadSummary) => {
+      togglePinnedThread(thread.id);
+      hapticSelection();
+      if (threadWithActions?.id === thread.id) {
+        closeThreadActions();
+      }
+    },
+    [closeThreadActions, threadWithActions?.id],
+  );
+  const returnToThreadActions = useCallback(() => {
+    setThreadToRename(undefined);
+    setRenameDraft("");
+  }, []);
+  const saveRenamedThread = useCallback(async () => {
+    const title = renameDraft.trim();
+    if (!canMutateAppServerThreads || !threadToRename || !title || renameThreadMutation.isPending) {
+      return;
+    }
+
+    try {
+      await renameThreadMutation.mutateAsync({ threadId: threadToRename.id, title });
+      setConnection("connected");
+      hapticSuccess();
+      setThreadWithActions(undefined);
+      setThreadToRename(undefined);
+      setRenameDraft("");
+    } catch (caught) {
+      setHasPairedSession(hasCodexRelaySession());
+      Alert.alert(
+        "Couldn’t rename chat",
+        caught instanceof Error ? caught.message : "Unable to rename this chat.",
+      );
+    }
+  }, [canMutateAppServerThreads, renameDraft, renameThreadMutation, threadToRename]);
+  const searchClearAnimatedStyle = useAnimatedStyle(() => ({
     opacity: searchProgress.value,
     transform: [
       { translateX: (1 - searchProgress.value) * 6 },
@@ -263,24 +330,37 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     opacity: searchProgress.value,
     transform: [{ translateY: (1 - searchProgress.value) * -4 }],
   }));
+  const sidebarResizeGesture = useMemo(
+    () =>
+      Gesture.Pan()
+        .runOnJS(true)
+        .onBegin(() => {
+          props.onSidebarResizeStart?.();
+          hapticSelection();
+        })
+        .onUpdate((event) => {
+          props.onSidebarResize?.(event.translationX);
+        }),
+    [props],
+  );
 
   useEffect(() => {
     const idleTask = requestIdleTask(
       () =>
         dispatchUi({
           type: "set-can-render-thread-list",
-          value: drawerStatus === "open",
+          value: isDrawerVisible,
         }),
       drawerListIdleTimeoutMs,
     );
     return () => cancelIdleTask(idleTask);
-  }, [drawerStatus]);
+  }, [isDrawerVisible]);
 
   useEffect(() => {
-    if (drawerStatus === "open") {
+    if (isDrawerVisible) {
       Keyboard.dismiss();
     }
-  }, [drawerStatus]);
+  }, [isDrawerVisible]);
 
   useEffect(() => {
     searchProgress.value = withTiming(normalizedSearchQuery ? 1 : 0, {
@@ -295,6 +375,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     loadWorkspaceDirectories,
     openNewThreadWorkspacePicker,
     openSettings,
+    openSsh,
     refreshProjects,
     selectThread,
     toggleProject,
@@ -317,12 +398,16 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     ({ item }: LegendListRenderItemProps<DrawerRow>) => (
       <DrawerRowItem
         archiveThreadPending={archiveThreadMutation.isPending}
+        canRenameThread={canMutateAppServerThreads}
         isCreatingThread={isCreatingThread}
         item={item}
         onArchiveThread={confirmArchiveThread}
         onCreateThread={createNewThread}
+        onOpenThreadActions={openThreadActions}
         onSelectThread={selectThread}
+        onTogglePinnedThread={handleTogglePinnedThread}
         onToggleProject={toggleProject}
+        pinned={item.kind === "thread" && pinnedThreadIds.includes(item.thread.id)}
         selected={item.kind === "thread" && item.thread.id === activeThreadId}
         workspacePath={workspacePath}
       />
@@ -330,9 +415,13 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     [
       activeThreadId,
       archiveThreadMutation.isPending,
+      canMutateAppServerThreads,
       confirmArchiveThread,
       createNewThread,
+      handleTogglePinnedThread,
       isCreatingThread,
+      openThreadActions,
+      pinnedThreadIds,
       selectThread,
       toggleProject,
       workspacePath,
@@ -346,7 +435,9 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         hapticSelection();
         props.navigation.closeDrawer();
       }}
+      showCloseButton={!props.isPermanent}
       onNewChat={() => void openNewThreadWorkspacePicker()}
+      onOpenSsh={openSsh}
       onRefreshProjects={() => void refreshProjects()}
       onSearchChange={(value) => dispatchUi({ type: "set-search-query", value })}
       onSearchClear={() => dispatchUi({ type: "set-search-query", value: "" })}
@@ -367,14 +458,13 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
   );
 
   return (
-    <View style={styles.drawerRoot}>
+    <View style={[styles.drawerRoot, { paddingLeft: insets.left }]}>
       {canRenderThreadList ? (
         <LegendList
           contentContainerStyle={[styles.listContent, { paddingBottom: 8, paddingTop: insets.top }]}
           data={rows}
           drawDistance={drawerListDrawDistance}
           estimatedItemSize={drawerRowEstimatedSize}
-          getFixedItemSize={getEstimatedDrawerRowSize}
           keyboardShouldPersistTaps="handled"
           keyExtractor={(item) => item.id}
           ListEmptyComponent={emptyList}
@@ -404,6 +494,82 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         workspaceBrowser={workspaceBrowser}
         workspaceRows={workspaceRows}
       />
+      <AppBottomSheet
+        onBack={threadToRename ? returnToThreadActions : undefined}
+        onClose={closeThreadActions}
+        scrollable={false}
+        subtitle={threadToRename ? "Choose a clear title for this chat." : threadWithActions?.title}
+        title={threadToRename ? "Rename chat" : "Chat actions"}
+        visible={Boolean(threadWithActions)}
+      >
+        {threadToRename ? (
+          <View style={styles.renameSheet}>
+            <AppBottomSheetTextInput
+              autoCapitalize="sentences"
+              autoCorrect
+              cursorColor={theme.text}
+              editable={!renameThreadMutation.isPending}
+              onChangeText={setRenameDraft}
+              onSubmitEditing={() => void saveRenamedThread()}
+              placeholder="Chat title"
+              placeholderTextColor={theme.textSecondary}
+              returnKeyType="done"
+              selectionColor="rgba(124, 199, 255, 0.28)"
+              style={[
+                styles.renameSheetInput,
+                { borderColor: "rgba(255, 255, 255, 0.14)", color: theme.text },
+              ]}
+              value={renameDraft}
+            />
+            <View style={styles.renameSheetActions}>
+              <Button
+                accessibilityLabel="Cancel chat rename"
+                disabled={renameThreadMutation.isPending}
+                onPress={returnToThreadActions}
+                size="default"
+                variant="ghost"
+              >
+                <Text style={{ color: theme.textSecondary }}>Cancel</Text>
+              </Button>
+              <Button
+                accessibilityLabel="Save chat name"
+                disabled={!canSaveRenamedThread}
+                onPress={() => void saveRenamedThread()}
+                size="default"
+              >
+                <Text>Save</Text>
+              </Button>
+            </View>
+          </View>
+        ) : threadWithActions ? (
+          <>
+            <SheetActionRow
+              accessibilityLabel={threadWithActionsIsPinned ? "Unpin chat" : "Pin chat"}
+              icon="pin"
+              onPress={() => handleTogglePinnedThread(threadWithActions)}
+              title={threadWithActionsIsPinned ? "Unpin chat" : "Pin chat"}
+            />
+            {canMutateAppServerThreads ? (
+              <SheetActionRow
+                accessibilityLabel="Rename chat"
+                icon="newChat"
+                onPress={openRenameThread}
+                title="Rename chat"
+              />
+            ) : null}
+          </>
+        ) : null}
+      </AppBottomSheet>
+      {props.showResizeHandle ? (
+        <GestureDetector gesture={sidebarResizeGesture}>
+          <Animated.View
+            accessibilityLabel="Resize threads sidebar"
+            style={styles.sidebarResizeHandle}
+          >
+            <View style={styles.sidebarResizeGrip} />
+          </Animated.View>
+        </GestureDetector>
+      ) : null}
     </View>
   );
 }
@@ -439,11 +605,13 @@ function useThreadDrawerActions({
   threadsById: Record<string, ThreadSummary>;
   workspacePath: string | undefined;
 }) {
-  const pendingThreadSelectionTaskRef = useRef<{ cancel: () => void } | undefined>(undefined);
+  const pendingDrawerActionTaskRef = useRef<IdleTask | undefined>(undefined);
+  const threadSelectionGenerationRef = useRef(0);
 
   useEffect(
     () => () => {
-      pendingThreadSelectionTaskRef.current?.cancel();
+      cancelIdleTask(pendingDrawerActionTaskRef.current);
+      threadSelectionGenerationRef.current += 1;
     },
     [],
   );
@@ -453,24 +621,24 @@ function useThreadDrawerActions({
   }, []);
 
   const activateSelectedThread = useCallback(
-    async (threadId: string) => {
+    async (threadId: string, selectionGeneration: number) => {
       const selectedThread = threadsById[threadId];
       setActiveThread(threadId);
       setThreadMessagesLoading(threadId, true);
       try {
         const response = await fetchThreadState(queryClient, threadId);
-        setThreadDetailState(
-          queryClient,
-          response.thread,
-          response.messages,
-          response.pendingInputRequests,
-        );
+        if (selectionGeneration !== threadSelectionGenerationRef.current) {
+          return;
+        }
         setActiveThread(response.thread.id);
         if (response.thread.state === "running") {
           requestThreadStreamReconnect(threadId);
         }
         setConnection("connected");
       } catch (caught) {
+        if (selectionGeneration !== threadSelectionGenerationRef.current) {
+          return;
+        }
         syncPairedSessionState();
         setThreadRunningState(queryClient, selectedThread?.id ?? threadId, false);
         setConnection(
@@ -488,13 +656,15 @@ function useThreadDrawerActions({
     (threadId: string) => {
       hapticSelection();
       navigation.closeDrawer();
-      pendingThreadSelectionTaskRef.current?.cancel();
+      cancelIdleTask(pendingDrawerActionTaskRef.current);
+      const selectionGeneration = threadSelectionGenerationRef.current + 1;
+      threadSelectionGenerationRef.current = selectionGeneration;
       if (chatStore$.activeThreadId.peek() === threadId) {
         return;
       }
-      pendingThreadSelectionTaskRef.current = InteractionManager.runAfterInteractions(() => {
-        void activateSelectedThread(threadId);
-      });
+      pendingDrawerActionTaskRef.current = requestIdleTask(() => {
+        void activateSelectedThread(threadId, selectionGeneration);
+      }, 300);
     },
     [activateSelectedThread, navigation],
   );
@@ -647,7 +817,19 @@ function useThreadDrawerActions({
   const openSettings = useCallback(() => {
     hapticSelection();
     navigation.closeDrawer();
-    router.push("/settings");
+    cancelIdleTask(pendingDrawerActionTaskRef.current);
+    pendingDrawerActionTaskRef.current = requestIdleTask(() => {
+      requestAnimationFrame(() => router.push("/settings"));
+    }, 300);
+  }, [navigation]);
+
+  const openSsh = useCallback(() => {
+    hapticSelection();
+    navigation.closeDrawer();
+    cancelIdleTask(pendingDrawerActionTaskRef.current);
+    pendingDrawerActionTaskRef.current = requestIdleTask(() => {
+      requestAnimationFrame(() => router.push("/ssh"));
+    }, 300);
   }, [navigation]);
 
   return {
@@ -656,6 +838,7 @@ function useThreadDrawerActions({
     loadWorkspaceDirectories,
     openNewThreadWorkspacePicker,
     openSettings,
+    openSsh,
     refreshProjects,
     selectThread,
     toggleProject,
@@ -713,28 +896,47 @@ function DrawerFooter({
 
 type DrawerRowItemProps = {
   archiveThreadPending: boolean;
+  canRenameThread: boolean;
   isCreatingThread: boolean;
   item: DrawerRow;
   onArchiveThread: (thread: ThreadSummary) => void;
   onCreateThread: (workspacePath: string | undefined) => Promise<void>;
+  onOpenThreadActions: (thread: ThreadSummary) => void;
   onSelectThread: (threadId: string) => void;
+  onTogglePinnedThread: (thread: ThreadSummary) => void;
   onToggleProject: (projectKey: string) => void;
+  pinned: boolean;
   selected: boolean;
   workspacePath: string | undefined;
 };
 
 const DrawerRowItem = memo(function DrawerRowItem({
   archiveThreadPending,
+  canRenameThread,
   isCreatingThread,
   item,
   onArchiveThread,
   onCreateThread,
+  onOpenThreadActions,
   onSelectThread,
+  onTogglePinnedThread,
   onToggleProject,
+  pinned,
   selected,
   workspacePath,
 }: DrawerRowItemProps) {
   const theme = useTheme();
+
+  if (item.kind === "pinned") {
+    return (
+      <View style={styles.projectHeader}>
+        <View style={styles.rowIconSlot}>
+          <Icon name="pin" size={15} tintColor={theme.textSecondary} />
+        </View>
+        <Text style={styles.projectTitle}>Pinned</Text>
+      </View>
+    );
+  }
 
   if (item.kind === "project") {
     return (
@@ -742,9 +944,7 @@ const DrawerRowItem = memo(function DrawerRowItem({
         <View style={styles.rowIconSlot}>
           <Icon name="folder" size={15} tintColor={theme.textSecondary} />
         </View>
-        <Text style={styles.projectTitle} numberOfLines={1}>
-          {item.title}
-        </Text>
+        <Text style={styles.projectTitle}>{item.title}</Text>
         <View style={styles.projectActions}>
           <Button
             accessibilityLabel={`Create new chat in ${item.title}`}
@@ -783,12 +983,27 @@ const DrawerRowItem = memo(function DrawerRowItem({
   }
 
   const running = item.thread.state === "running";
+  const relativeTime = formatRelativeTime(item.thread.lastActivityAt ?? item.thread.updatedAt);
   return (
     <View style={[styles.thread, selected && styles.threadSelected]}>
       <Pressable
+        accessibilityActions={[
+          { label: pinned ? "Unpin chat" : "Pin chat", name: "toggle-pin" },
+          ...(canRenameThread ? [{ label: "Rename chat", name: "rename" }] : []),
+        ]}
+        accessibilityHint="Long press for chat actions"
         accessibilityRole="button"
         accessibilityLabel={`Open thread ${item.thread.title}`}
         accessibilityState={{ selected }}
+        delayLongPress={350}
+        onAccessibilityAction={(event) => {
+          if (event.nativeEvent.actionName === "toggle-pin") {
+            onTogglePinnedThread(item.thread);
+          } else if (event.nativeEvent.actionName === "rename" && canRenameThread) {
+            onOpenThreadActions(item.thread);
+          }
+        }}
+        onLongPress={() => onOpenThreadActions(item.thread)}
         onPress={() => void onSelectThread(item.thread.id)}
         style={styles.threadOpenButton}
       >
@@ -802,11 +1017,13 @@ const DrawerRowItem = memo(function DrawerRowItem({
               )}
             </View>
             <View style={[styles.threadContent, pressed && styles.drawerPressedContent]}>
-              <Text style={styles.threadTitle} numberOfLines={1}>
-                {item.thread.title}
-              </Text>
-              <Text style={styles.threadTime} numberOfLines={1}>
-                {formatRelativeTime(item.thread.lastActivityAt ?? item.thread.updatedAt)}
+              <Text style={styles.threadTitle}>{item.thread.title}</Text>
+              <Text
+                ellipsizeMode={item.workspaceTitle ? "middle" : "tail"}
+                numberOfLines={1}
+                style={styles.threadTime}
+              >
+                {item.workspaceTitle ? `${item.workspaceTitle} · ${relativeTime}` : relativeTime}
               </Text>
             </View>
           </>
@@ -829,13 +1046,17 @@ const DrawerRowItem = memo(function DrawerRowItem({
 function areDrawerRowItemsEqual(previous: DrawerRowItemProps, next: DrawerRowItemProps) {
   if (
     previous.archiveThreadPending !== next.archiveThreadPending ||
+    previous.canRenameThread !== next.canRenameThread ||
     previous.isCreatingThread !== next.isCreatingThread ||
     previous.item.kind !== next.item.kind ||
     previous.item.id !== next.item.id ||
     previous.onArchiveThread !== next.onArchiveThread ||
     previous.onCreateThread !== next.onCreateThread ||
+    previous.onOpenThreadActions !== next.onOpenThreadActions ||
     previous.onSelectThread !== next.onSelectThread ||
+    previous.onTogglePinnedThread !== next.onTogglePinnedThread ||
     previous.onToggleProject !== next.onToggleProject ||
+    previous.pinned !== next.pinned ||
     previous.selected !== next.selected ||
     previous.workspacePath !== next.workspacePath
   ) {
@@ -844,11 +1065,12 @@ function areDrawerRowItemsEqual(previous: DrawerRowItemProps, next: DrawerRowIte
 
   if (previous.item.kind === "thread" && next.item.kind === "thread") {
     return (
-      previous.item.thread === next.item.thread ||
-      (previous.item.thread.title === next.item.thread.title &&
-        previous.item.thread.state === next.item.thread.state &&
-        previous.item.thread.lastActivityAt === next.item.thread.lastActivityAt &&
-        previous.item.thread.updatedAt === next.item.thread.updatedAt)
+      previous.item.workspaceTitle === next.item.workspaceTitle &&
+      (previous.item.thread === next.item.thread ||
+        (previous.item.thread.title === next.item.thread.title &&
+          previous.item.thread.state === next.item.thread.state &&
+          previous.item.thread.lastActivityAt === next.item.thread.lastActivityAt &&
+          previous.item.thread.updatedAt === next.item.thread.updatedAt))
     );
   }
 
@@ -870,21 +1092,30 @@ function DrawerListHeader({
   isRefreshingProjects,
   onCloseMenu,
   onNewChat,
+  onOpenSsh,
   onRefreshProjects,
   onSearchChange,
   onSearchClear,
   searchClearAnimatedStyle,
   searchQuery,
+  showCloseButton,
   versionCompatibility,
 }: {
   isRefreshingProjects: boolean;
   onCloseMenu: () => void;
   onNewChat: () => void;
+  onOpenSsh: () => void;
   onRefreshProjects: () => void;
   onSearchChange: (value: string) => void;
   onSearchClear: () => void;
-  searchClearAnimatedStyle: ReturnType<typeof useAnimatedStyle<ViewStyle>>;
+  searchClearAnimatedStyle: ReturnType<
+    typeof useAnimatedStyle<{
+      opacity: number;
+      transform: ({ translateX: number } | { scale: number })[];
+    }>
+  >;
   searchQuery: string;
+  showCloseButton: boolean;
   versionCompatibility: RelayVersionCompatibility | undefined;
 }) {
   const theme = useTheme();
@@ -893,15 +1124,17 @@ function DrawerListHeader({
     <View style={styles.header}>
       <View style={styles.brandRow}>
         <Text style={styles.brandText}>Codex Relay</Text>
-        <Button
-          accessibilityLabel="Close menu"
-          onPress={onCloseMenu}
-          size="icon"
-          variant="ghost"
-          className="ml-auto size-8 rounded-md active:bg-accent/70"
-        >
-          <Icon name="closeMenu" size={17} tintColor={theme.textSecondary} />
-        </Button>
+        {showCloseButton ? (
+          <Button
+            accessibilityLabel="Close menu"
+            onPress={onCloseMenu}
+            size="icon"
+            variant="ghost"
+            className="ml-auto size-8 rounded-md active:bg-accent/70"
+          >
+            <Icon name="closeMenu" size={17} tintColor={theme.textSecondary} />
+          </Button>
+        ) : null}
       </View>
       <View style={styles.searchShell}>
         <Icon name="search" size={14} tintColor={theme.textSecondary} />
@@ -953,6 +1186,21 @@ function DrawerListHeader({
             <Text style={[styles.newChatText, pressed && styles.drawerPressedContent]}>
               New Chat
             </Text>
+          </>
+        )}
+      </Pressable>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="SSH"
+        onPress={onOpenSsh}
+        style={styles.newChatRow}
+      >
+        {({ pressed }) => (
+          <>
+            <View style={[styles.newChatIcon, pressed && styles.drawerPressedContent]}>
+              <Icon name="terminal" size={14} tintColor={theme.text} />
+            </View>
+            <Text style={[styles.newChatText, pressed && styles.drawerPressedContent]}>SSH</Text>
           </>
         )}
       </Pressable>
@@ -1050,7 +1298,7 @@ function WorkspaceBrowserModal({
               </Pressable>
               <View style={styles.workspaceLocation}>
                 <Text style={styles.workspaceLocationTitle} numberOfLines={1}>
-                  {projectName(currentBrowserPath)}
+                  {workspaceName(currentBrowserPath) ?? "codex-relay"}
                 </Text>
                 <Text style={styles.workspaceLocationPath} numberOfLines={1}>
                   {currentBrowserPath ?? "codex-relay"}
@@ -1095,7 +1343,7 @@ function WorkspaceBrowserModal({
               onPress={() => void onCreateThread(currentBrowserPath)}
               selected
               title="New Chat Here"
-              subtitle={projectName(currentBrowserPath)}
+              subtitle={workspaceName(currentBrowserPath) ?? "codex-relay"}
             />
           </View>
         </View>
@@ -1225,70 +1473,6 @@ function VersionNoticeRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-function buildDrawerRows(
-  threads: ThreadSummary[],
-  expandedProjects: Record<string, boolean>,
-  activeThreadId: string | undefined,
-  forceExpanded = false,
-): DrawerRow[] {
-  const groups = new Map<
-    string,
-    { title: string; threads: ThreadSummary[]; workspacePath?: string }
-  >();
-
-  for (const thread of threads) {
-    const title = projectName(thread.cwd);
-    const key = thread.cwd ?? title;
-    const group = groups.get(key);
-    if (group) {
-      group.threads.push(thread);
-    } else {
-      groups.set(key, { title, threads: [thread], workspacePath: thread.cwd });
-    }
-  }
-
-  return [...groups.entries()].flatMap(([projectKey, group]) => {
-    const isExpanded = forceExpanded || (expandedProjects[projectKey] ?? false);
-    const activeThread = activeThreadId
-      ? group.threads.find((thread) => thread.id === activeThreadId)
-      : undefined;
-    const collapsedThreads = group.threads.slice(0, collapsedProjectThreadCount);
-    const visibleThreads =
-      isExpanded || !activeThread || collapsedThreads.includes(activeThread)
-        ? isExpanded
-          ? group.threads
-          : collapsedThreads
-        : [...collapsedThreads.slice(0, collapsedProjectThreadCount - 1), activeThread];
-    const hiddenCount = group.threads.length - visibleThreads.length;
-    const projectRows: DrawerRow[] = [
-      {
-        id: `project:${projectKey}`,
-        kind: "project",
-        projectKey,
-        title: group.title,
-        workspacePath: group.workspacePath,
-      },
-      ...visibleThreads.map((thread) => ({
-        id: `thread:${thread.id}`,
-        kind: "thread" as const,
-        projectKey,
-        thread,
-      })),
-    ];
-
-    if (hiddenCount > 0) {
-      projectRows.push({
-        id: `more:${projectKey}`,
-        kind: "more",
-        hiddenCount,
-        projectKey,
-      });
-    }
-
-    return projectRows;
-  });
-}
-
 function workspaceBrowserRows(browser: WorkspaceBrowser | undefined): WorkspaceBrowserRow[] {
   if (!browser) {
     return [];
@@ -1321,12 +1505,8 @@ function indexThreadsById(threads: ThreadSummary[]) {
   return threadsById;
 }
 
-function getEstimatedDrawerRowSize(row: DrawerRow) {
-  return row.kind === "thread" ? 44 : 32;
-}
-
 function getDrawerStatus(state: ThreadDrawerContentProps["state"]) {
-  const drawerHistoryEntry = state.history.find(
+  const drawerHistoryEntry = state.history?.find(
     (entry): entry is { status: "closed" | "open"; type: "drawer" } => entry.type === "drawer",
   );
   return drawerHistoryEntry?.status ?? "closed";
@@ -1350,7 +1530,10 @@ function requestIdleTask(callback: () => void, timeout: number): IdleTask {
   return { id: setTimeout(callback, timeout), kind: "timeout" };
 }
 
-function cancelIdleTask(task: IdleTask) {
+function cancelIdleTask(task: IdleTask | undefined) {
+  if (!task) {
+    return;
+  }
   if (task.kind === "idle") {
     (
       globalThis as typeof globalThis & {
@@ -1379,15 +1562,6 @@ function normalizeSearchValue(value: string | undefined) {
   return (value ?? "").trim().toLocaleLowerCase();
 }
 
-function projectName(cwd: string | undefined) {
-  if (!cwd) {
-    return "codex-relay";
-  }
-
-  const parts = cwd.split("/").filter(Boolean);
-  return parts.at(-1) ?? cwd;
-}
-
 function formatRelativeTime(value: string) {
   const then = new Date(value).getTime();
   const diffMs = Date.now() - then;
@@ -1414,6 +1588,7 @@ function formatRelativeTime(value: string) {
 const styles = StyleSheet.create({
   drawerRoot: {
     flex: 1,
+    position: "relative",
   },
   listContent: {
     flexGrow: 1,
@@ -1445,6 +1620,7 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     flexDirection: "row",
     height: 32,
+    marginHorizontal: 4,
     paddingHorizontal: 9,
   },
   searchInput: {
@@ -1540,7 +1716,7 @@ const styles = StyleSheet.create({
     borderRadius: 7,
     flexDirection: "row",
     minHeight: 36,
-    paddingHorizontal: 0,
+    paddingHorizontal: 8,
   },
   newChatIcon: {
     alignItems: "center",
@@ -1558,12 +1734,14 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 2,
     marginLeft: "auto",
+    marginRight: 10,
   },
   sectionHeader: {
     alignItems: "center",
     flexDirection: "row",
     marginTop: 8,
     minHeight: 28,
+    paddingLeft: 8,
   },
   sectionTitle: {
     fontSize: 11,
@@ -1575,11 +1753,13 @@ const styles = StyleSheet.create({
   projectHeader: {
     alignItems: "center",
     flexDirection: "row",
-    height: 32,
+    minHeight: 32,
     paddingRight: 2,
+    paddingVertical: 4,
   },
   projectTitle: {
     flex: 1,
+    flexShrink: 1,
     fontSize: 12,
     fontWeight: "500",
     lineHeight: 16,
@@ -1627,11 +1807,46 @@ const styles = StyleSheet.create({
     lineHeight: 14,
     opacity: 0.62,
   },
+  renameSheet: {
+    gap: 14,
+  },
+  renameSheetInput: {
+    borderRadius: 12,
+    borderWidth: 1,
+    fontFamily: Fonts.sansMedium,
+    fontSize: 15,
+    lineHeight: 20,
+    minHeight: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  renameSheetActions: {
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "flex-end",
+  },
   threadSelected: {
     backgroundColor: "rgba(255, 255, 255, 0.075)",
   },
   drawerPressedContent: {
     opacity: 0.68,
+  },
+  sidebarResizeGrip: {
+    backgroundColor: "rgba(255, 255, 255, 0.2)",
+    borderRadius: 1,
+    height: 44,
+    opacity: 0.72,
+    width: 2,
+  },
+  sidebarResizeHandle: {
+    alignItems: "center",
+    bottom: 0,
+    justifyContent: "center",
+    position: "absolute",
+    right: -8,
+    top: 0,
+    width: 16,
+    zIndex: 40,
   },
   emptySearchState: {
     alignItems: "center",

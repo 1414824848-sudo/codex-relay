@@ -37,6 +37,7 @@ export const threadRunStreamEventTypes: StreamThreadRunEvent["type"][] = [
   "thread.message.delta",
   "thread.message.completed",
   "thread.state.changed",
+  "thread.goal.updated",
   "thread.error",
   "thread.preview_target.detected",
   "thread.input_request.created",
@@ -133,6 +134,53 @@ export function isTerminalThreadRunEvent(event: StreamThreadRunEvent) {
 
 export function isSuccessfulThreadRunTerminalEvent(event: StreamThreadRunEvent) {
   return event.type === "thread.state.changed" && event.thread.state === "completed";
+}
+
+export function reconcileThreadRunEventAfterTerminal(
+  event: StreamThreadRunEvent,
+  terminalEvent: StreamThreadRunEvent | undefined,
+): StreamThreadRunEvent | undefined {
+  if (!terminalEvent) {
+    return event;
+  }
+
+  const terminalState =
+    terminalEvent.type === "thread.state.changed"
+      ? {
+          lastError: terminalEvent.thread.lastError,
+          state: terminalEvent.thread.state,
+        }
+      : terminalEvent.type === "thread.error"
+        ? {
+            lastError: terminalEvent.thread?.lastError ?? terminalEvent.error.message,
+            state: terminalEvent.thread?.state ?? ("failed" as const),
+          }
+        : undefined;
+  switch (event.type) {
+    case "thread.message.created":
+    case "thread.message.completed":
+      return terminalState
+        ? {
+            ...event,
+            thread: {
+              ...event.thread,
+              ...terminalState,
+            },
+          }
+        : event;
+    case "thread.error":
+      return terminalState && event.thread
+        ? {
+            ...event,
+            thread: {
+              ...event.thread,
+              ...terminalState,
+            },
+          }
+        : event;
+    default:
+      return undefined;
+  }
 }
 
 export function handleThreadRunStreamEvent(
